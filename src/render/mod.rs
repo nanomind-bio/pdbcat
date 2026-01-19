@@ -10,7 +10,7 @@ pub mod braille;
 mod pixel;
 
 pub use camera::{Camera, ProjectionMode};
-pub use pixel::{PixelBuffer, downsample_2x};
+pub use pixel::{PixelBuffer, downsample_2x, apply_silhouette_edges};
 
 /// Representation style for rendering molecules
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

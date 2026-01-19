@@ -5,7 +5,7 @@
 mod output;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
-use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x};
+use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -1148,6 +1148,11 @@ fn run_loop(
         let t1 = Instant::now();
 
         app.render_molecule(&mut buffer, ssaa_pixels_per_cell);
+
+        // Apply silhouette edges when shading is enabled (ChimeraX-style outlines)
+        if app.shading_enabled {
+            apply_silhouette_edges(&mut buffer, 0.15, 0.5);
+        }
         let t2 = Instant::now();
 
         // Downsample if using supersampling, otherwise use buffer directly

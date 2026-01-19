@@ -446,3 +446,76 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
 
     dst
 }
+
+/// Apply silhouette edge detection to darken edges where depth changes sharply.
+/// This creates a ChimeraX-style outline effect that enhances depth perception.
+pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold: f32) {
+    let width = buffer.width;
+    let height = buffer.height;
+
+    if width < 3 || height < 3 {
+        return;
+    }
+
+    // Store edge intensities (we can't modify colors while reading neighbors)
+    let mut edge_factors: Vec<f32> = vec![0.0; width * height];
+
+    // Sobel-like edge detection on depth buffer
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let idx = y * width + x;
+
+            // Skip transparent pixels
+            if buffer.colors[idx].3 == 0 {
+                continue;
+            }
+
+            // Sample 3x3 neighborhood depths
+            let d_tl = buffer.depth[(y - 1) * width + (x - 1)];
+            let d_t  = buffer.depth[(y - 1) * width + x];
+            let d_tr = buffer.depth[(y - 1) * width + (x + 1)];
+            let d_l  = buffer.depth[y * width + (x - 1)];
+            let d_c  = buffer.depth[idx];
+            let d_r  = buffer.depth[y * width + (x + 1)];
+            let d_bl = buffer.depth[(y + 1) * width + (x - 1)];
+            let d_b  = buffer.depth[(y + 1) * width + x];
+            let d_br = buffer.depth[(y + 1) * width + (x + 1)];
+
+            // Sobel gradient (horizontal and vertical)
+            let gx = (d_tr + 2.0 * d_r + d_br) - (d_tl + 2.0 * d_l + d_bl);
+            let gy = (d_bl + 2.0 * d_b + d_br) - (d_tl + 2.0 * d_t + d_tr);
+
+            // Gradient magnitude
+            let gradient = (gx * gx + gy * gy).sqrt();
+
+            // Also detect edges at object boundaries (large depth discontinuities)
+            let max_neighbor = d_tl.max(d_t).max(d_tr).max(d_l).max(d_r).max(d_bl).max(d_b).max(d_br);
+            let min_neighbor = d_tl.min(d_t).min(d_tr).min(d_l).min(d_r).min(d_bl).min(d_b).min(d_br);
+            let depth_range = max_neighbor - min_neighbor;
+
+            // Combine gradient and depth discontinuity
+            let edge_strength = gradient.max(depth_range * 0.5);
+
+            if edge_strength > threshold {
+                // Normalize edge strength above threshold
+                let factor = ((edge_strength - threshold) * strength).min(0.7);
+                edge_factors[idx] = factor;
+            }
+        }
+    }
+
+    // Apply darkening based on edge factors
+    for idx in 0..width * height {
+        let factor = edge_factors[idx];
+        if factor > 0.0 {
+            let (r, g, b, a) = buffer.colors[idx];
+            let darken = 1.0 - factor;
+            buffer.colors[idx] = (
+                (r as f32 * darken) as u8,
+                (g as f32 * darken) as u8,
+                (b as f32 * darken) as u8,
+                a,
+            );
+        }
+    }
+}
