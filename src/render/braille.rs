@@ -11,7 +11,8 @@ pub fn depth_cue(color: (u8, u8, u8), z: f32, z_near: f32, z_far: f32) -> (u8, u
 
     // Normalize depth to 0.0 (far) to 1.0 (near)
     let depth_factor = (z - z_far) / (z_near - z_far);
-    let depth_factor = depth_factor.clamp(0.3, 1.0);
+    // Softer depth cue: far objects retain 50% brightness (was 30%)
+    let depth_factor = depth_factor.clamp(0.5, 1.0);
 
     (
         (color.0 as f32 * depth_factor) as u8,
