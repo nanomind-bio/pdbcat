@@ -6,13 +6,11 @@
 mod atom;
 mod assembly;
 mod bond;
-mod chain;
 mod secondary;
 
 pub use atom::{Atom, Element};
 pub use assembly::{Assembly, AssemblyInstance, Transform};
 pub use bond::{Bond, BondOrder};
-pub use chain::Chain;
 pub use secondary::{HelixType, SecondaryStructure, SecondaryStructureAssignment};
 
 use nalgebra::Vector3;

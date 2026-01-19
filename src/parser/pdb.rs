@@ -23,6 +23,8 @@ pub fn parse_pdb(content: &str) -> Result<Molecule, ParseError> {
     let mut in_first_model = true;
     let mut seen_model = false;
     let mut chain_set: HashSet<char> = HashSet::new();
+    // Track TER record positions to mark chain breaks
+    let mut ter_positions: HashSet<(char, i32)> = HashSet::new();
 
     for (line_num, line) in content.lines().enumerate() {
         let record_type = if line.len() >= 6 {
@@ -48,6 +50,17 @@ pub fn parse_pdb(content: &str) -> Result<Molecule, ParseError> {
                 chain_set.insert(atom.chain_id);
                 molecule.atoms.push(atom);
             }
+            "TER" if in_first_model => {
+                // Parse TER record to mark chain termination
+                // TER records mark the end of a polymer chain
+                // Handle both standard (long) and short TER records
+                let padded = format!("{:80}", line);
+                let chain_id = padded.chars().nth(21).unwrap_or(' ');
+                let res_seq: i32 = padded[22..26].trim().parse().unwrap_or(0);
+                if chain_id != ' ' || res_seq != 0 {
+                    ter_positions.insert((chain_id, res_seq));
+                }
+            }
             "HELIX" => {
                 if let Some(ss) = parse_helix_record(line, line_num + 1)? {
                     molecule.secondary_structure.push(ss);
@@ -65,7 +78,7 @@ pub fn parse_pdb(content: &str) -> Result<Molecule, ParseError> {
 
     molecule.chains = chain_set.into_iter().collect();
     molecule.chains.sort();
-    molecule.bonds = determine_bonds_shared(&molecule.atoms);
+    molecule.bonds = determine_bonds_with_ter(&molecule.atoms, &ter_positions);
 
     Ok(molecule)
 }
@@ -99,12 +112,8 @@ fn parse_atom_record(line: &str, line_num: usize, is_hetatm: bool) -> Result<Ato
     let element = if !element_str.is_empty() {
         Element::from_symbol(element_str)
     } else {
-        let name_chars: String = name.chars().filter(|c| c.is_alphabetic()).collect();
-        if name_chars.is_empty() {
-            Element::Unknown
-        } else {
-            Element::from_symbol(&name_chars[0..1])
-        }
+        // Infer element from atom name when element column is empty
+        infer_element_from_name(&name)
     };
 
     Ok(Atom {
@@ -181,16 +190,46 @@ fn parse_float(s: &str, line_num: usize, field: &str) -> Result<f32, ParseError>
         })
 }
 
+/// Infer element from atom name when element column is empty
+/// Tries two-letter elements first (e.g., "FE", "CA", "ZN"), then single letter
+fn infer_element_from_name(name: &str) -> Element {
+    // Extract only alphabetic characters from the name
+    let letters: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+
+    if letters.is_empty() {
+        return Element::Unknown;
+    }
+
+    // Try two-letter element first (handles Fe, Zn, Ca, Mg, Na, Cl, Br, Se, etc.)
+    if letters.len() >= 2 {
+        let two_letter = &letters[0..2];
+        let elem = Element::from_symbol(two_letter);
+        if elem != Element::Unknown {
+            return elem;
+        }
+    }
+
+    // Fall back to single letter
+    Element::from_symbol(&letters[0..1])
+}
+
 /// Determine bonds using residue topology and distance heuristics
 /// This function is public so it can be shared with the mmCIF parser
 pub fn determine_bonds_shared(atoms: &[Atom]) -> Vec<Bond> {
+    // Call with empty TER positions for backward compatibility
+    determine_bonds_with_ter(atoms, &HashSet::new())
+}
+
+/// Determine bonds with TER record awareness
+/// TER records mark chain terminations and prevent peptide bonds across breaks
+fn determine_bonds_with_ter(atoms: &[Atom], ter_positions: &HashSet<(char, i32)>) -> Vec<Bond> {
     let mut bonds = Vec::new();
 
-    // Group atoms by residue
-    let mut residue_atoms: HashMap<(char, i32), Vec<usize>> = HashMap::new();
+    // Group atoms by residue (including insertion code for uniqueness)
+    let mut residue_atoms: HashMap<(char, i32, Option<char>), Vec<usize>> = HashMap::new();
     for (idx, atom) in atoms.iter().enumerate() {
         residue_atoms
-            .entry((atom.chain_id, atom.residue_seq))
+            .entry((atom.chain_id, atom.residue_seq, atom.ins_code))
             .or_default()
             .push(idx);
     }
@@ -214,15 +253,46 @@ pub fn determine_bonds_shared(atoms: &[Atom]) -> Vec<Bond> {
     }
 
     // Add peptide bonds (C-N between consecutive residues)
+    // Respects TER records and insertion codes
     let mut prev_c: Option<usize> = None;
     let mut prev_chain: Option<char> = None;
     let mut prev_seq: Option<i32> = None;
+    let mut prev_ins_code: Option<char> = None;
 
     for (idx, atom) in atoms.iter().enumerate() {
-        if atom.name == "N" {
+        if atom.name == "N" && !atom.is_hetatm {
             if let (Some(c_idx), Some(pc), Some(ps)) = (prev_c, prev_chain, prev_seq) {
-                if atom.chain_id == pc && atom.residue_seq == ps + 1 {
-                    bonds.push(Bond::single(c_idx, idx));
+                // Check if this is the same chain
+                if atom.chain_id == pc {
+                    // Check for TER record between previous C and current N
+                    let has_ter = ter_positions.contains(&(pc, ps));
+
+                    if !has_ter {
+                        // Determine if residues are consecutive
+                        // Handle insertion codes: residues with same seq number but different
+                        // insertion codes (e.g., 50, 50A, 50B) are consecutive
+                        let is_consecutive = if atom.residue_seq == ps + 1 && atom.ins_code.is_none() && prev_ins_code.is_none() {
+                            // Simple case: sequential residue numbers, no insertion codes
+                            true
+                        } else if atom.residue_seq == ps {
+                            // Same residue number - check insertion code progression
+                            // e.g., 50 -> 50A, or 50A -> 50B
+                            match (prev_ins_code, atom.ins_code) {
+                                (None, Some(_)) => true,  // 50 -> 50A
+                                (Some(p), Some(c)) => (c as u8) == (p as u8) + 1,  // 50A -> 50B
+                                _ => false,
+                            }
+                        } else if atom.residue_seq == ps + 1 && prev_ins_code.is_some() && atom.ins_code.is_none() {
+                            // e.g., 50B -> 51
+                            true
+                        } else {
+                            false
+                        };
+
+                        if is_consecutive {
+                            bonds.push(Bond::single(c_idx, idx));
+                        }
+                    }
                 }
             }
         }
@@ -230,6 +300,7 @@ pub fn determine_bonds_shared(atoms: &[Atom]) -> Vec<Bond> {
             prev_c = Some(idx);
             prev_chain = Some(atom.chain_id);
             prev_seq = Some(atom.residue_seq);
+            prev_ins_code = atom.ins_code;
         }
     }
 
@@ -240,6 +311,7 @@ pub fn determine_bonds_shared(atoms: &[Atom]) -> Vec<Bond> {
 }
 
 /// Add bonds based on distance for atoms without topology
+/// Uses spatial hashing for O(n) average complexity instead of O(n²)
 fn add_distance_bonds(atoms: &[Atom], bonds: &mut Vec<Bond>) {
     let hetatm_indices: Vec<usize> = atoms
         .iter()
@@ -248,13 +320,64 @@ fn add_distance_bonds(atoms: &[Atom], bonds: &mut Vec<Bond>) {
         .map(|(i, _)| i)
         .collect();
 
-    for (i, &idx1) in hetatm_indices.iter().enumerate() {
-        for &idx2 in hetatm_indices.iter().skip(i + 1) {
-            let dist = (atoms[idx1].coord - atoms[idx2].coord).magnitude();
-            let max_bond_dist = atoms[idx1].vdw_radius() + atoms[idx2].vdw_radius() - 0.4;
+    if hetatm_indices.is_empty() {
+        return;
+    }
 
-            if dist < max_bond_dist && dist > 0.4 {
-                bonds.push(Bond::single(idx1, idx2));
+    // Use spatial hashing with cell size based on max possible bond distance
+    // Max VdW radius is ~2.75 (K), so max bond dist is ~2.75 + 2.75 - 0.4 = 5.1
+    const CELL_SIZE: f32 = 5.5;
+
+    // Build spatial hash grid
+    let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for &idx in &hetatm_indices {
+        let coord = &atoms[idx].coord;
+        let cell = (
+            (coord.x / CELL_SIZE).floor() as i32,
+            (coord.y / CELL_SIZE).floor() as i32,
+            (coord.z / CELL_SIZE).floor() as i32,
+        );
+        grid.entry(cell).or_default().push(idx);
+    }
+
+    // Check for bonds using spatial neighbors
+    let mut checked: HashSet<(usize, usize)> = HashSet::new();
+
+    for &idx1 in &hetatm_indices {
+        let coord1 = &atoms[idx1].coord;
+        let cell = (
+            (coord1.x / CELL_SIZE).floor() as i32,
+            (coord1.y / CELL_SIZE).floor() as i32,
+            (coord1.z / CELL_SIZE).floor() as i32,
+        );
+
+        // Check this cell and all 26 neighboring cells
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let neighbor_cell = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
+                    if let Some(neighbors) = grid.get(&neighbor_cell) {
+                        for &idx2 in neighbors {
+                            if idx1 >= idx2 {
+                                continue; // Avoid duplicates
+                            }
+
+                            let pair = (idx1.min(idx2), idx1.max(idx2));
+                            if checked.contains(&pair) {
+                                continue;
+                            }
+                            checked.insert(pair);
+
+                            let dist = (atoms[idx1].coord - atoms[idx2].coord).magnitude();
+                            let max_bond_dist =
+                                atoms[idx1].vdw_radius() + atoms[idx2].vdw_radius() - 0.4;
+
+                            if dist < max_bond_dist && dist > 0.4 {
+                                bonds.push(Bond::single(idx1, idx2));
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -5,7 +5,7 @@
 mod output;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
-use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color};
+use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -20,6 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -93,28 +94,49 @@ struct App {
     default_assembly: Assembly,
     /// Current assembly index
     assembly_index: usize,
-    /// Chain visibility (indexed by chain ID - 'A' offset)
-    chain_visible: [bool; 26],
+    /// Chain visibility map (supports any chain ID character)
+    chain_visible: HashMap<char, bool>,
     /// Mouse drag state
     mouse_drag: Option<(u16, u16)>,
     /// Last frame time for FPS calculation
     last_frame: Instant,
     /// Current FPS
     fps: f32,
+    /// Frame counter for instrumentation
+    frame_count: u64,
+    /// Current render backend
+    backend: RenderBackend,
+    /// Whether backend changed (requires screen clear)
+    backend_changed: bool,
     /// Whether to quit
     should_quit: bool,
 }
 
+/// Sanitize a string for safe display in terminal
+/// Removes control characters that could be used for terminal escape injection
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 impl App {
-    fn new(path: &Path, molecule: Molecule) -> Self {
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+    fn new(path: &Path, molecule: Molecule, backend: RenderBackend) -> Self {
+        let filename = sanitize_for_display(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown"),
+        );
 
         let center = molecule.center();
         let camera = Camera::new(center);
+
+        // Initialize chain visibility map with all chains visible
+        let chain_visible: HashMap<char, bool> = molecule
+            .chains
+            .iter()
+            .map(|&c| (c, true))
+            .collect();
 
         let mut app = Self {
             molecule,
@@ -131,10 +153,13 @@ impl App {
             alt_loc_mode: AltLocMode::A,
             default_assembly: Assembly::single_identity(),
             assembly_index: 0,
-            chain_visible: [true; 26],
+            chain_visible,
             mouse_drag: None,
             last_frame: Instant::now(),
             fps: 0.0,
+            frame_count: 0,
+            backend,
+            backend_changed: false,
             should_quit: false,
         };
 
@@ -183,6 +208,12 @@ impl App {
             KeyCode::F(3) => {
                 self.show_waters = !self.show_waters;
             }
+            KeyCode::Char('v') => {
+                self.camera.toggle_projection();
+            }
+            KeyCode::Char('b') => {
+                self.cycle_backend();
+            }
             KeyCode::Char('0') => {
                 self.fit_camera_to_current_assembly();
             }
@@ -201,15 +232,31 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                self.camera.pan(Vector2::new(-0.1, 0.0));
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Rotate left around Y axis
+                    self.camera.trackball_rotate(
+                        Vector2::new(0.0, 0.0),
+                        Vector2::new(-0.05, 0.0),
+                    );
+                } else {
+                    self.camera.pan(Vector2::new(-0.1, 0.0));
+                }
             }
             KeyCode::Right => {
-                self.camera.pan(Vector2::new(0.1, 0.0));
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Rotate right around Y axis
+                    self.camera.trackball_rotate(
+                        Vector2::new(0.0, 0.0),
+                        Vector2::new(0.05, 0.0),
+                    );
+                } else {
+                    self.camera.pan(Vector2::new(0.1, 0.0));
+                }
             }
             KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                let idx = (c as u8 - b'A') as usize;
-                if idx < 26 {
-                    self.chain_visible[idx] = !self.chain_visible[idx];
+                // Toggle chain visibility if this chain exists
+                if let Some(visible) = self.chain_visible.get_mut(&c) {
+                    *visible = !*visible;
                 }
             }
             _ => {}
@@ -250,16 +297,11 @@ impl App {
     }
 
     fn is_atom_visible(&self, atom: &crate::molecule::Atom) -> bool {
-        // Check chain visibility
-        let chain_idx = if atom.chain_id.is_ascii_uppercase() {
-            (atom.chain_id as u8 - b'A') as usize
-        } else if atom.chain_id.is_ascii_lowercase() {
-            (atom.chain_id as u8 - b'a') as usize
-        } else {
-            0
-        };
-        if chain_idx < 26 && !self.chain_visible[chain_idx] {
-            return false;
+        // Check chain visibility using the HashMap
+        if let Some(&visible) = self.chain_visible.get(&atom.chain_id) {
+            if !visible {
+                return false;
+            }
         }
 
         // Check alternate location visibility
@@ -302,18 +344,21 @@ impl App {
         SecondaryStructure::Coil
     }
 
-    fn render_molecule(&self, buffer: &mut PixelBuffer, pixels_per_cell: (usize, usize)) {
+    fn render_molecule(&self, buffer: &mut PixelBuffer, _pixels_per_cell: (usize, usize)) {
         let pixel_width = buffer.width() as f32;
         let pixel_height = buffer.height() as f32;
         let center_x = pixel_width / 2.0;
         let center_y = pixel_height / 2.0;
 
-        let cell_width = pixel_width / pixels_per_cell.0 as f32;
-        let cell_height = pixel_height / pixels_per_cell.1 as f32;
-        let base_scale = cell_width.min(cell_height) * 0.4 * self.camera.zoom;
-        let scale_x = base_scale * pixels_per_cell.0 as f32;
-        let scale_y = base_scale * pixels_per_cell.1 as f32;
-        let scale = (scale_x + scale_y) * 0.5;
+        // Use uniform scaling based on pixel dimensions to maintain aspect ratio
+        // Scale factor of 0.45 means molecule spans ~90% of the smaller dimension
+        // (±0.45 of half = 45% per side = 90% total)
+        let base_scale = pixel_width.min(pixel_height) * 0.45;
+        let scale_x = base_scale;
+        let scale_y = base_scale;
+        let scale = base_scale;
+        // Screen scale for perspective projection - based on viewport size
+        let screen_scale = pixel_width.min(pixel_height) * 0.5 * self.camera.zoom;
 
         // Collect visible atoms with their screen positions per assembly instance
         let mut projected_instances: Vec<Vec<(usize, f32, f32, f32, (u8, u8, u8))>> = Vec::new();
@@ -331,7 +376,7 @@ impl App {
                 }
 
                 let world = instance.transform.apply(atom.coord);
-                let (screen_pos, z) = self.camera.project(world);
+                let (screen_pos, z) = self.camera.project_with_scale(world, screen_scale);
                 let sx = center_x + screen_pos.x * scale_x;
                 let sy = center_y + screen_pos.y * scale_y;
 
@@ -458,6 +503,7 @@ impl App {
             .collect();
 
         // Draw bonds first (behind atoms)
+        let bond_radius = scale * 0.08; // Cylinder radius for bonds
         for bond in &self.molecule.bonds {
             if let (Some(&(x1, y1, z1, c1)), Some(&(x2, y2, z2, _c2))) =
                 (proj_map.get(&bond.atom1), proj_map.get(&bond.atom2))
@@ -468,11 +514,16 @@ impl App {
                 } else {
                     c1
                 };
-                buffer.draw_line(x1, y1, z1, x2, y2, z2, color);
+                if self.shading_enabled && bond_radius > 1.0 {
+                    // Use shaded cylinders for hi-fi rendering
+                    buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, bond_radius.min(3.0), color);
+                } else {
+                    buffer.draw_line(x1, y1, z1, x2, y2, z2, color);
+                }
             }
         }
 
-        // Draw atoms
+        // Draw atoms with Blinn-Phong shading when enabled
         for (idx, x, y, z, color) in projected {
             let atom = &self.molecule.atoms[*idx];
             let radius = atom.vdw_radius() * scale * 0.15; // Scale down for visibility
@@ -481,7 +532,11 @@ impl App {
             } else {
                 *color
             };
-            buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+            if self.shading_enabled {
+                buffer.draw_sphere_shaded(*x, *y, *z, radius.max(1.0), color);
+            } else {
+                buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+            }
         }
     }
 
@@ -506,7 +561,11 @@ impl App {
             } else {
                 *color
             };
-            buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+            if self.shading_enabled {
+                buffer.draw_sphere_shaded(*x, *y, *z, radius.max(1.0), color);
+            } else {
+                buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+            }
         }
     }
 
@@ -515,7 +574,7 @@ impl App {
         &self,
         buffer: &mut PixelBuffer,
         projected: &[(usize, f32, f32, f32, (u8, u8, u8))],
-        scale: f32,
+        _scale: f32,
         z_min: f32,
         z_max: f32,
     ) {
@@ -537,83 +596,174 @@ impl App {
             .map(|(idx, x, y, z, c)| (*idx, (*x, *y, *z, *c)))
             .collect();
 
-        let helix_width = (2.6 * scale).max(2.0);
-        let sheet_width = (2.2 * scale).max(1.8);
-        let coil_width = (1.2 * scale).max(1.0);
-        let arrow_length = (sheet_width * 1.6).max(3.0);
-        let arrow_width = (sheet_width * 1.8).max(3.0);
+        // Size scale for ribbon widths - based on screen size, not position scale
+        // Target: helix ~3-5% of screen height, sheet ~2-4%, coil ~1-2%
+        let pixel_width = buffer.width() as f32;
+        let pixel_height = buffer.height() as f32;
+        let size_scale = pixel_height.min(pixel_width) / 40.0;
+        let helix_width = (1.8 * size_scale).max(3.0);
+        let sheet_width = (1.4 * size_scale).max(2.5);
+        let coil_width = (0.6 * size_scale).max(1.5);
+        let arrow_length = (sheet_width * 1.6).max(4.0);
+        let arrow_width = (sheet_width * 1.8).max(4.0);
 
-        // Track previous residue for drawing
+        // For spline rendering, we need to collect chain segments
+        if self.shading_enabled {
+            // Spline-based rendering for hi-fi mode
+            self.render_cartoon_spline(
+                buffer, &backbone_indices, &proj_map,
+                helix_width, sheet_width, coil_width,
+                arrow_length, arrow_width, z_min, z_max,
+            );
+        } else {
+            // Original linear rendering
+            self.render_cartoon_linear(
+                buffer, &backbone_indices, &proj_map,
+                helix_width, sheet_width, coil_width,
+                arrow_length, arrow_width, z_min, z_max,
+            );
+        }
+    }
+
+    /// Linear cartoon rendering (original method)
+    fn render_cartoon_linear(
+        &self,
+        buffer: &mut PixelBuffer,
+        backbone_indices: &[usize],
+        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))>,
+        helix_width: f32,
+        sheet_width: f32,
+        coil_width: f32,
+        arrow_length: f32,
+        arrow_width: f32,
+        z_min: f32,
+        z_max: f32,
+    ) {
+        use crate::render::braille::depth_cue;
+
         let mut prev: Option<(char, i32, f32, f32, f32, (u8, u8, u8), SecondaryStructure)> = None;
         let mut last_segment_dir: Option<Vector2<f32>> = None;
 
-        for &idx in &backbone_indices {
+        for &idx in backbone_indices {
             let atom = &self.molecule.atoms[idx];
             if let Some((x, y, z, color)) = proj_map.get(&idx) {
                 let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
-                let color = if self.shading_enabled {
-                    depth_cue(*color, *z, z_max, z_min)
-                } else {
-                    *color
-                };
+                let color = depth_cue(*color, *z, z_max, z_min);
 
                 if let Some((prev_chain, prev_seq, px, py, pz, prev_color, prev_ss)) = prev {
-                    // Only connect if same chain and consecutive residue
                     if atom.chain_id == prev_chain && atom.residue_seq == prev_seq + 1 {
                         let segment_dir = Vector2::new(*x - px, *y - py);
                         last_segment_dir = Some(segment_dir);
 
-                        // Determine ribbon width based on secondary structure
-                        match (&prev_ss, &ss) {
-                            (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => {
-                                // Helices get thick ribbons
-                                self.draw_ribbon(buffer, px, py, pz, *x, *y, *z, color, helix_width);
-                            }
-                            (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => {
-                                // Sheets get medium-width flat ribbons
-                                self.draw_ribbon(buffer, px, py, pz, *x, *y, *z, color, sheet_width);
-                            }
-                            _ => {
-                                // Coils get thin tubes
-                                self.draw_ribbon(buffer, px, py, pz, *x, *y, *z, color, coil_width);
-                            }
+                        let width = match (&prev_ss, &ss) {
+                            (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
+                            (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => sheet_width,
+                            _ => coil_width,
                         };
+                        self.draw_ribbon(buffer, px, py, pz, *x, *y, *z, color, width);
 
-                        if matches!(prev_ss, SecondaryStructure::Sheet)
-                            && !matches!(ss, SecondaryStructure::Sheet)
-                        {
-                            self.draw_arrowhead(
-                                buffer,
-                                px,
-                                py,
-                                pz,
-                                segment_dir,
-                                prev_color,
-                                arrow_length,
-                                arrow_width,
-                            );
+                        if matches!(prev_ss, SecondaryStructure::Sheet) && !matches!(ss, SecondaryStructure::Sheet) {
+                            self.draw_arrowhead(buffer, px, py, pz, segment_dir, prev_color, arrow_length, arrow_width);
                         }
                     } else {
                         last_segment_dir = None;
                     }
                 }
-
                 prev = Some((atom.chain_id, atom.residue_seq, *x, *y, *z, color, ss));
             }
         }
 
         if let (Some((_, _, px, py, pz, color, ss)), Some(dir)) = (prev, last_segment_dir) {
             if matches!(ss, SecondaryStructure::Sheet) {
-                self.draw_arrowhead(
-                    buffer,
-                    px,
-                    py,
-                    pz,
-                    dir,
-                    color,
-                    arrow_length,
-                    arrow_width,
-                );
+                self.draw_arrowhead(buffer, px, py, pz, dir, color, arrow_length, arrow_width);
+            }
+        }
+    }
+
+    /// Spline-based cartoon rendering for hi-fi mode
+    fn render_cartoon_spline(
+        &self,
+        buffer: &mut PixelBuffer,
+        backbone_indices: &[usize],
+        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))>,
+        helix_width: f32,
+        sheet_width: f32,
+        coil_width: f32,
+        arrow_length: f32,
+        arrow_width: f32,
+        z_min: f32,
+        z_max: f32,
+    ) {
+        use crate::render::braille::depth_cue;
+
+        // Collect chain segments with positions
+        let mut segments: Vec<(f32, f32, f32, (u8, u8, u8), SecondaryStructure, char, i32)> = Vec::new();
+
+        for &idx in backbone_indices {
+            let atom = &self.molecule.atoms[idx];
+            if let Some((x, y, z, color)) = proj_map.get(&idx) {
+                let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
+                let color = depth_cue(*color, *z, z_max, z_min);
+                segments.push((*x, *y, *z, color, ss, atom.chain_id, atom.residue_seq));
+            }
+        }
+
+        if segments.len() < 2 {
+            return;
+        }
+
+        // Draw spline through consecutive segments
+        for i in 0..segments.len() - 1 {
+            let (x1, y1, z1, c1, ss1, chain1, seq1) = segments[i];
+            let (x2, y2, z2, _c2, ss2, chain2, seq2) = segments[i + 1];
+
+            // Only connect consecutive residues in same chain
+            if chain1 != chain2 || seq2 != seq1 + 1 {
+                continue;
+            }
+
+            // Get control points for Catmull-Rom spline
+            let p0 = if i > 0 && segments[i - 1].5 == chain1 && segments[i - 1].6 == seq1 - 1 {
+                (segments[i - 1].0, segments[i - 1].1, segments[i - 1].2)
+            } else {
+                // Reflect p1 around p0 direction
+                (2.0 * x1 - x2, 2.0 * y1 - y2, 2.0 * z1 - z2)
+            };
+
+            let p3 = if i + 2 < segments.len() && segments[i + 2].5 == chain2 && segments[i + 2].6 == seq2 + 1 {
+                (segments[i + 2].0, segments[i + 2].1, segments[i + 2].2)
+            } else {
+                // Reflect p2 around p3 direction
+                (2.0 * x2 - x1, 2.0 * y2 - y1, 2.0 * z2 - z1)
+            };
+
+            let p1 = (x1, y1, z1);
+            let p2 = (x2, y2, z2);
+
+            // Determine width based on secondary structure
+            let width = match (&ss1, &ss2) {
+                (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
+                (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => sheet_width,
+                _ => coil_width,
+            };
+
+            // Draw spline with shaded cylinders
+            self.draw_spline_ribbon_shaded(buffer, p0, p1, p2, p3, c1, width);
+
+            // Draw arrowhead at end of sheets
+            if matches!(ss1, SecondaryStructure::Sheet) && !matches!(ss2, SecondaryStructure::Sheet) {
+                let dir = Vector2::new(x2 - x1, y2 - y1);
+                self.draw_arrowhead(buffer, x1, y1, z1, dir, c1, arrow_length, arrow_width);
+            }
+        }
+
+        // Handle final arrowhead
+        if segments.len() >= 2 {
+            let last = &segments[segments.len() - 1];
+            let prev = &segments[segments.len() - 2];
+            if last.5 == prev.5 && last.6 == prev.6 + 1 && matches!(last.4, SecondaryStructure::Sheet) {
+                let dir = Vector2::new(last.0 - prev.0, last.1 - prev.1);
+                self.draw_arrowhead(buffer, last.0, last.1, last.2, dir, last.3, arrow_length, arrow_width);
             }
         }
     }
@@ -662,6 +812,115 @@ impl App {
                 z2,
                 color,
             );
+        }
+    }
+
+    /// Draw a smooth spline-based ribbon segment using Catmull-Rom interpolation
+    fn draw_spline_ribbon(
+        &self,
+        buffer: &mut PixelBuffer,
+        p0: (f32, f32, f32),  // Control point before start
+        p1: (f32, f32, f32),  // Start point
+        p2: (f32, f32, f32),  // End point
+        p3: (f32, f32, f32),  // Control point after end
+        color: (u8, u8, u8),
+        width: f32,
+    ) {
+        // Number of interpolation steps (more = smoother)
+        let steps = 8;
+
+        let mut prev_x = p1.0;
+        let mut prev_y = p1.1;
+        let mut prev_z = p1.2;
+
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+
+            // Catmull-Rom spline interpolation
+            let t2 = t * t;
+            let t3 = t2 * t;
+
+            let x = 0.5 * ((2.0 * p1.0)
+                + (-p0.0 + p2.0) * t
+                + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+
+            let y = 0.5 * ((2.0 * p1.1)
+                + (-p0.1 + p2.1) * t
+                + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+
+            let z = 0.5 * ((2.0 * p1.2)
+                + (-p0.2 + p2.2) * t
+                + (2.0 * p0.2 - 5.0 * p1.2 + 4.0 * p2.2 - p3.2) * t2
+                + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
+
+            // Draw ribbon segment
+            self.draw_ribbon(buffer, prev_x, prev_y, prev_z, x, y, z, color, width);
+
+            prev_x = x;
+            prev_y = y;
+            prev_z = z;
+        }
+    }
+
+    /// Draw a shaded ribbon segment with 3D tube appearance
+    fn draw_ribbon_shaded(
+        &self,
+        buffer: &mut PixelBuffer,
+        x1: f32,
+        y1: f32,
+        z1: f32,
+        x2: f32,
+        y2: f32,
+        z2: f32,
+        color: (u8, u8, u8),
+        width: f32,
+    ) {
+        buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, width * 0.5, color);
+    }
+
+    /// Draw a smooth spline-based ribbon with shading
+    fn draw_spline_ribbon_shaded(
+        &self,
+        buffer: &mut PixelBuffer,
+        p0: (f32, f32, f32),
+        p1: (f32, f32, f32),
+        p2: (f32, f32, f32),
+        p3: (f32, f32, f32),
+        color: (u8, u8, u8),
+        width: f32,
+    ) {
+        let steps = 6;
+        let mut prev_x = p1.0;
+        let mut prev_y = p1.1;
+        let mut prev_z = p1.2;
+
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+
+            let x = 0.5 * ((2.0 * p1.0)
+                + (-p0.0 + p2.0) * t
+                + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+
+            let y = 0.5 * ((2.0 * p1.1)
+                + (-p0.1 + p2.1) * t
+                + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+
+            let z = 0.5 * ((2.0 * p1.2)
+                + (-p0.2 + p2.2) * t
+                + (2.0 * p0.2 - 5.0 * p1.2 + 4.0 * p2.2 - p3.2) * t2
+                + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
+
+            self.draw_ribbon_shaded(buffer, prev_x, prev_y, prev_z, x, y, z, color, width);
+
+            prev_x = x;
+            prev_y = y;
+            prev_z = z;
         }
     }
 
@@ -752,6 +1011,18 @@ impl App {
         }
     }
 
+    /// Cycle through available render backends
+    fn cycle_backend(&mut self) {
+        use output::{ImageProtocol, RenderBackend};
+        self.backend = match self.backend {
+            RenderBackend::HalfBlock => RenderBackend::Image(ImageProtocol::Kitty),
+            RenderBackend::Image(ImageProtocol::Kitty) => RenderBackend::Image(ImageProtocol::ITerm2),
+            RenderBackend::Image(ImageProtocol::ITerm2) => RenderBackend::Image(ImageProtocol::Sixel),
+            RenderBackend::Image(ImageProtocol::Sixel) => RenderBackend::HalfBlock,
+        };
+        self.backend_changed = true;
+    }
+
     fn fit_camera_to_current_assembly(&mut self) {
         let (min, max) = self.current_assembly_bounds();
         let center = (min + max) / 2.0;
@@ -776,14 +1047,14 @@ pub fn run(path: &Path, molecule: Molecule) -> Result<(), UiError> {
         event::EnableMouseCapture
     )?;
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let crossterm_backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(crossterm_backend)?;
 
-    let mut app = App::new(path, molecule);
-    let backend = detect_backend();
+    let render_backend = detect_backend();
+    let mut app = App::new(path, molecule, render_backend);
 
     // Main loop
-    let result = run_loop(&mut terminal, &mut app, backend);
+    let result = run_loop(&mut terminal, &mut app);
 
     // Cleanup
     terminal::disable_raw_mode()?;
@@ -800,8 +1071,10 @@ pub fn run(path: &Path, molecule: Molecule) -> Result<(), UiError> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
-    backend: RenderBackend,
 ) -> Result<(), UiError> {
+    // Reusable pixel buffer - avoids allocation each frame
+    let mut buffer = PixelBuffer::new(1, 1);
+
     loop {
         // Calculate FPS
         let now = Instant::now();
@@ -826,33 +1099,94 @@ fn run_loop(
         }
         let mol_width = size.width.max(1);
 
-        let image_active = matches!(backend, RenderBackend::Image(_)) && !app.show_help;
+        let image_active = matches!(app.backend, RenderBackend::Image(_)) && !app.show_help;
         let pixels_per_cell = if app.show_help {
             (1, 2)
         } else {
-            match backend {
+            match app.backend {
                 RenderBackend::HalfBlock => (1, 2),
                 RenderBackend::Image(output::ImageProtocol::Sixel) => (1, 6),
-                RenderBackend::Image(_) => (2, 4),
+                // Resolution for Kitty/iTerm2 - (2,4) for performance, (4,8) for quality
+                // With shading disabled, can use higher res; with shading, use lower
+                RenderBackend::Image(_) => if app.shading_enabled { (2, 4) } else { (4, 8) },
             }
         };
         let pixel_width = mol_width as usize * pixels_per_cell.0;
         let pixel_height = mol_height as usize * pixels_per_cell.1;
-        let mut buffer = PixelBuffer::new(pixel_width, pixel_height);
-        buffer.clear();
-        app.render_molecule(&mut buffer, pixels_per_cell);
+
+        // Use 2x supersampling when shading is enabled for anti-aliasing
+        let use_ssaa = app.shading_enabled && image_active;
+        let (render_width, render_height) = if use_ssaa {
+            (pixel_width * 2, pixel_height * 2)
+        } else {
+            (pixel_width, pixel_height)
+        };
+
+        // Scale factor for supersampling
+        let ssaa_pixels_per_cell = if use_ssaa {
+            (pixels_per_cell.0 * 2, pixels_per_cell.1 * 2)
+        } else {
+            pixels_per_cell
+        };
+
+        // Clear screen when backend changes to remove stale images from previous protocol
+        if app.backend_changed {
+            execute!(
+                terminal.backend_mut(),
+                terminal::Clear(terminal::ClearType::All),
+                cursor::MoveTo(0, 0)
+            )?;
+            app.backend_changed = false;
+        }
+
+        // Timing instrumentation
+        let t0 = Instant::now();
+
+        // Resize buffer only if dimensions changed, otherwise just clear
+        buffer.resize_or_clear(render_width, render_height);
+        let t1 = Instant::now();
+
+        app.render_molecule(&mut buffer, ssaa_pixels_per_cell);
+        let t2 = Instant::now();
+
+        // Downsample if using supersampling, otherwise use buffer directly
+        let downsampled;
+        let final_buffer: &PixelBuffer = if use_ssaa {
+            downsampled = downsample_2x(&buffer);
+            &downsampled
+        } else {
+            &buffer
+        };
+        let t3 = Instant::now();
 
         // Render
         terminal.draw(|f| {
-            let buffer_ref = if image_active { None } else { Some(&buffer) };
-            draw_ui(f, app, backend, mol_height, buffer_ref);
+            let buffer_ref = if image_active { None } else { Some(final_buffer) };
+            draw_ui(f, app, app.backend, mol_height, buffer_ref);
         })?;
+        let t4 = Instant::now();
 
         if image_active {
-            if let RenderBackend::Image(protocol) = backend {
-                render_image(protocol, &buffer, mol_width, mol_height, terminal.backend_mut())?;
+            if let RenderBackend::Image(protocol) = app.backend {
+                render_image(protocol, final_buffer, mol_width, mol_height, terminal.backend_mut())?;
             }
         }
+        let t5 = Instant::now();
+
+        // Log timing every 30 frames
+        if app.frame_count % 30 == 0 {
+            eprintln!(
+                "TIMING: resize={:.1}ms render={:.1}ms downsample={:.1}ms draw_ui={:.1}ms image={:.1}ms total={:.1}ms ({}x{})",
+                t1.duration_since(t0).as_secs_f32() * 1000.0,
+                t2.duration_since(t1).as_secs_f32() * 1000.0,
+                t3.duration_since(t2).as_secs_f32() * 1000.0,
+                t4.duration_since(t3).as_secs_f32() * 1000.0,
+                t5.duration_since(t4).as_secs_f32() * 1000.0,
+                t5.duration_since(t0).as_secs_f32() * 1000.0,
+                render_width, render_height
+            );
+        }
+        app.frame_count += 1;
 
         // Handle events with timeout for animation
         let timeout = if app.auto_spin {
@@ -863,7 +1197,7 @@ fn run_loop(
 
         if event::poll(timeout)? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
                     app.handle_key(key.code, key.modifiers);
                 }
                 Event::Mouse(mouse) => {
@@ -909,12 +1243,13 @@ fn draw_ui(
         if hud_height > 0 {
             let hud_area = Rect::new(0, mol_height, size.width, hud_height);
             let hud_text = format!(
-                " {} | {} chains, {} atoms | {} | {} | Backend: {} | Asm: {} ({}/{}) | AltLoc: {} | FPS: {:.0} | q: quit, Tab: repr, c: color, /: asm, ': altloc, h: help, F1: HUD",
+                " {} | {} chains, {} atoms | {} | {} | {} | Backend: {} | Asm: {} ({}/{}) | AltLoc: {} | FPS: {:.0} | q: quit, Tab: repr, c: color, v: proj, h: help, F1: HUD",
                 app.filename,
                 app.molecule.chain_count(),
                 app.molecule.atom_count(),
                 app.representation.name(),
                 app.color_scheme.name(),
+                app.camera.projection.name(),
                 backend.label(),
                 app.current_assembly_id(),
                 app.assembly_index + 1,
@@ -1017,13 +1352,16 @@ const HELP_LINES: &[&str] = &[
     "  Scroll         : zoom",
     "  Arrow keys     : pan",
     "  Shift+Up/Down  : zoom in/out",
+    "  Shift+Left/Right: rotate",
     "  0              : reset view",
+    "  v              : toggle projection",
     "  p              : toggle auto-spin",
     "",
     "Display",
     "  Tab            : cycle representation",
     "  c              : cycle color scheme",
     "  s              : toggle shading",
+    "  b              : cycle backend",
     "  /              : cycle assemblies",
     "  '              : cycle altloc",
     "  l              : toggle ligands",

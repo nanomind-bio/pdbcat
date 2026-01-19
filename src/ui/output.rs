@@ -1,6 +1,8 @@
 //! Terminal output backends for images and half-block fallback.
 
 use crate::render::PixelBuffer;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use std::env;
 use std::io::{self, Write};
 
@@ -98,11 +100,13 @@ fn render_iterm2_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u1
     let png = encode_png(buffer);
     let payload = base64_encode(&png);
 
+    // Use cell-based sizing with explicit "cell" units
+    // doNotMoveCursor=1 prevents cursor jump/scroll after image
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b[H");
     seq.extend_from_slice(
         format!(
-            "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0:",
+            "\x1b]1337;File=inline=1;size={};width={}cell;height={}cell;doNotMoveCursor=1:",
             png.len(),
             cell_width,
             cell_height
@@ -244,7 +248,7 @@ fn encode_png(buffer: &PixelBuffer) -> Vec<u8> {
         }
     }
 
-    let compressed = zlib_store(&raw);
+    let compressed = zlib_compress(&raw);
     let mut png = Vec::new();
     png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
 
@@ -263,26 +267,10 @@ fn encode_png(buffer: &PixelBuffer) -> Vec<u8> {
     png
 }
 
-fn zlib_store(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(0x78);
-    out.push(0x01);
-
-    let mut pos = 0;
-    while pos < data.len() {
-        let remaining = data.len() - pos;
-        let block_len = remaining.min(65535);
-        let bfinal = if pos + block_len >= data.len() { 1 } else { 0 };
-        out.push(bfinal);
-        out.extend_from_slice(&(block_len as u16).to_le_bytes());
-        out.extend_from_slice(&(!(block_len as u16)).to_le_bytes());
-        out.extend_from_slice(&data[pos..pos + block_len]);
-        pos += block_len;
-    }
-
-    let adler = adler32(data);
-    out.extend_from_slice(&adler.to_be_bytes());
-    out
+fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).expect("zlib compression failed");
+    encoder.finish().expect("zlib finish failed")
 }
 
 fn write_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
@@ -293,27 +281,33 @@ fn write_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
+/// Pre-computed CRC32 lookup table for PNG (polynomial 0xEDB88320)
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in chunk_type.iter().chain(data.iter()) {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = if crc & 1 == 1 { 0xEDB8_8320 } else { 0 };
-            crc = (crc >> 1) ^ mask;
-        }
+        crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + byte as u32) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
 }
 
 fn base64_encode(data: &[u8]) -> String {

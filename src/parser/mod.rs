@@ -1,7 +1,7 @@
 //! File format parsers for PDB and mmCIF files
 
-mod pdb;
-mod mmcif;
+pub mod pdb;
+pub mod mmcif;
 mod topology;
 
 pub use pdb::parse_pdb;
