@@ -179,6 +179,25 @@ impl PixelBuffer {
         self.height
     }
 
+    /// Get raw depth buffer for parallel access
+    pub fn depth_buffer(&self) -> &[f32] {
+        &self.depth
+    }
+
+    /// Merge another buffer into this one using depth testing.
+    /// Used for combining parallel-rendered tile buffers.
+    pub fn merge_from(&mut self, other: &PixelBuffer) {
+        debug_assert_eq!(self.width, other.width);
+        debug_assert_eq!(self.height, other.height);
+
+        for i in 0..self.colors.len() {
+            if other.colors[i].3 > 0 && other.depth[i] > self.depth[i] {
+                self.colors[i] = other.colors[i];
+                self.depth[i] = other.depth[i];
+            }
+        }
+    }
+
     /// Get a pixel's RGBA value.
     pub fn get_pixel(&self, x: usize, y: usize) -> (u8, u8, u8, u8) {
         if x >= self.width || y >= self.height {

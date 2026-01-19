@@ -5,7 +5,8 @@
 mod output;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
-use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges, apply_ssao, apply_tone_mapping};
+use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges};
+use rayon::prelude::*;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -502,19 +503,31 @@ impl App {
     ) {
         use crate::render::braille::depth_cue;
 
-        // Create a map from atom index to projected position (includes size_scale)
+        let width = buffer.width();
+        let height = buffer.height();
+
+        // Create a map from atom index to projected position
         let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
             .iter()
             .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
             .collect();
 
-        // Draw bonds first (behind atoms)
+        // Collect all primitives for parallel rendering
+        enum Primitive {
+            Sphere { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8) },
+            Cylinder { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8) },
+            Line { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8) },
+            Circle { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8) },
+        }
+
+        let mut primitives: Vec<Primitive> = Vec::with_capacity(self.molecule.bonds.len() + projected.len());
+
+        // Collect bond primitives
         for bond in &self.molecule.bonds {
             if let (Some(&(x1, y1, z1, ss1, c1)), Some(&(x2, y2, z2, ss2, _c2))) =
                 (proj_map.get(&bond.atom1), proj_map.get(&bond.atom2))
             {
                 let avg_z = (z1 + z2) / 2.0;
-                // Use average size_scale for bond radius (perspective-correct)
                 let avg_size_scale = (ss1 + ss2) / 2.0;
                 let bond_radius = scale * 0.08 * avg_size_scale / self.camera.zoom;
                 let color = if self.shading_enabled {
@@ -523,18 +536,16 @@ impl App {
                     c1
                 };
                 if self.shading_enabled && bond_radius > 1.0 {
-                    // Use shaded cylinders for hi-fi rendering
-                    buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, bond_radius.min(4.0), color);
+                    primitives.push(Primitive::Cylinder { x0: x1, y0: y1, z0: z1, x1: x2, y1: y2, z1: z2, radius: bond_radius.min(4.0), color });
                 } else {
-                    buffer.draw_line(x1, y1, z1, x2, y2, z2, color);
+                    primitives.push(Primitive::Line { x0: x1, y0: y1, z0: z1, x1: x2, y1: y2, z1: z2, color });
                 }
             }
         }
 
-        // Draw atoms with Blinn-Phong shading when enabled
+        // Collect atom primitives
         for (idx, x, y, z, size_scale, color) in projected {
             let atom = &self.molecule.atoms[*idx];
-            // Use size_scale for perspective-correct radius (divide by base zoom to normalize)
             let radius = atom.vdw_radius() * scale * 0.15 * size_scale / self.camera.zoom;
             let color = if self.shading_enabled {
                 depth_cue(*color, *z, z_max, z_min)
@@ -542,9 +553,47 @@ impl App {
                 *color
             };
             if self.shading_enabled {
-                buffer.draw_sphere_shaded(*x, *y, *z, radius.max(1.0), color);
+                primitives.push(Primitive::Sphere { x: *x, y: *y, z: *z, radius: radius.max(1.0), color });
             } else {
-                buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+                primitives.push(Primitive::Circle { x: *x, y: *y, z: *z, radius: radius.max(1.0), color });
+            }
+        }
+
+        // Render primitives in parallel using thread-local buffers
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (primitives.len() + num_threads - 1) / num_threads;
+
+        if primitives.len() < 100 || !self.shading_enabled {
+            // Small number of primitives or no shading - render directly
+            for prim in &primitives {
+                match prim {
+                    Primitive::Sphere { x, y, z, radius, color } => buffer.draw_sphere_shaded(*x, *y, *z, *radius, *color),
+                    Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color } => buffer.draw_cylinder_shaded(*x0, *y0, *z0, *x1, *y1, *z1, *radius, *color),
+                    Primitive::Line { x0, y0, z0, x1, y1, z1, color } => buffer.draw_line(*x0, *y0, *z0, *x1, *y1, *z1, *color),
+                    Primitive::Circle { x, y, z, radius, color } => buffer.draw_circle(*x, *y, *z, *radius, *color),
+                }
+            }
+        } else {
+            // Parallel rendering for large primitive counts
+            let local_buffers: Vec<PixelBuffer> = primitives
+                .par_chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    let mut local = PixelBuffer::new(width, height);
+                    for prim in chunk {
+                        match prim {
+                            Primitive::Sphere { x, y, z, radius, color } => local.draw_sphere_shaded(*x, *y, *z, *radius, *color),
+                            Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color } => local.draw_cylinder_shaded(*x0, *y0, *z0, *x1, *y1, *z1, *radius, *color),
+                            Primitive::Line { x0, y0, z0, x1, y1, z1, color } => local.draw_line(*x0, *y0, *z0, *x1, *y1, *z1, *color),
+                            Primitive::Circle { x, y, z, radius, color } => local.draw_circle(*x, *y, *z, *radius, *color),
+                        }
+                    }
+                    local
+                })
+                .collect();
+
+            // Merge all thread-local buffers
+            for local in &local_buffers {
+                buffer.merge_from(local);
             }
         }
     }
@@ -559,22 +608,53 @@ impl App {
     ) {
         use crate::render::braille::depth_cue;
 
+        let width = buffer.width();
+        let height = buffer.height();
         let probe_radius = 1.4_f32;
         let surface_scale = 0.15_f32;
 
-        for (idx, x, y, z, size_scale, color) in projected {
-            let atom = &self.molecule.atoms[*idx];
-            // Use size_scale for perspective-correct radius
-            let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale * size_scale / self.camera.zoom;
-            let color = if self.shading_enabled {
-                depth_cue(*color, *z, z_max, z_min)
-            } else {
-                *color
-            };
-            if self.shading_enabled {
-                buffer.draw_sphere_shaded(*x, *y, *z, radius.max(1.0), color);
-            } else {
-                buffer.draw_circle(*x, *y, *z, radius.max(1.0), color);
+        // Pre-compute sphere parameters
+        let spheres: Vec<(f32, f32, f32, f32, (u8, u8, u8))> = projected
+            .iter()
+            .map(|(idx, x, y, z, size_scale, color)| {
+                let atom = &self.molecule.atoms[*idx];
+                let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale * size_scale / self.camera.zoom;
+                let color = if self.shading_enabled {
+                    depth_cue(*color, *z, z_max, z_min)
+                } else {
+                    *color
+                };
+                (*x, *y, *z, radius.max(1.0), color)
+            })
+            .collect();
+
+        if spheres.len() < 100 || !self.shading_enabled {
+            // Small count - render directly
+            for (x, y, z, radius, color) in &spheres {
+                if self.shading_enabled {
+                    buffer.draw_sphere_shaded(*x, *y, *z, *radius, *color);
+                } else {
+                    buffer.draw_circle(*x, *y, *z, *radius, *color);
+                }
+            }
+        } else {
+            // Parallel rendering
+            let num_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (spheres.len() + num_threads - 1) / num_threads;
+
+            let local_buffers: Vec<PixelBuffer> = spheres
+                .par_chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    let mut local = PixelBuffer::new(width, height);
+                    for (x, y, z, radius, color) in chunk {
+                        local.draw_sphere_shaded(*x, *y, *z, *radius, *color);
+                    }
+                    local
+                })
+                .collect();
+
+            for local in &local_buffers {
+                buffer.merge_from(local);
             }
         }
     }
@@ -1159,14 +1239,10 @@ fn run_loop(
 
         app.render_molecule(&mut buffer, ssaa_pixels_per_cell);
 
-        // Apply post-processing effects when shading is enabled
+        // Apply silhouette edges when shading is enabled (ChimeraX-style outlines)
+        // Note: SSAO and tone mapping disabled for performance
         if app.shading_enabled {
-            // SSAO for enhanced depth perception (soft shadows in crevices)
-            apply_ssao(&mut buffer, 4.0, 0.6);
-            // Silhouette edges (ChimeraX-style outlines)
             apply_silhouette_edges(&mut buffer, 0.15, 0.5);
-            // ACES tone mapping for professional color reproduction
-            apply_tone_mapping(&mut buffer, 1.1);
         }
         let t2 = Instant::now();
 
