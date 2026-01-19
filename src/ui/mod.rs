@@ -1109,7 +1109,10 @@ fn run_loop(
         } else {
             match app.backend {
                 RenderBackend::HalfBlock => (1, 2),
-                RenderBackend::Image(output::ImageProtocol::Sixel) => (1, 6),
+                // Sixel uses 6 vertical pixels per band, horizontal matches other backends
+                RenderBackend::Image(output::ImageProtocol::Sixel) => {
+                    if app.shading_enabled { (2, 6) } else { (4, 6) }
+                }
                 // Resolution for Kitty/iTerm2 - (2,4) for performance, (4,8) for quality
                 // With shading disabled, can use higher res; with shading, use lower
                 RenderBackend::Image(_) => if app.shading_enabled { (2, 4) } else { (4, 8) },

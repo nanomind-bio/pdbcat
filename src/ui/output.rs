@@ -145,7 +145,10 @@ fn render_sixel_sequence(buffer: &PixelBuffer) -> Vec<u8> {
 
     let mut seq: Vec<u8> = Vec::new();
     seq.extend_from_slice(b"\x1b[H");
-    seq.extend_from_slice(b"\x1bPq");
+    // Start sixel with raster attributes: "Pan;Pad;Ph;Pv where:
+    // Pan/Pad = pixel aspect ratio (1:1), Ph = width, Pv = height
+    // This tells the terminal the intended image dimensions
+    seq.extend_from_slice(format!("\x1bPq\"1;1;{};{}", width, height).as_bytes());
     seq.extend_from_slice(b"#0;2;0;0;0");
 
     for idx in 1..=216 {
