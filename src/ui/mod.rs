@@ -236,7 +236,7 @@ impl App {
                     // Rotate left around Y axis
                     self.camera.trackball_rotate(
                         Vector2::new(0.0, 0.0),
-                        Vector2::new(-0.05, 0.0),
+                        Vector2::new(-0.02, 0.0),
                     );
                 } else {
                     self.camera.pan(Vector2::new(-0.1, 0.0));
@@ -247,7 +247,7 @@ impl App {
                     // Rotate right around Y axis
                     self.camera.trackball_rotate(
                         Vector2::new(0.0, 0.0),
-                        Vector2::new(0.05, 0.0),
+                        Vector2::new(0.02, 0.0),
                     );
                 } else {
                     self.camera.pan(Vector2::new(0.1, 0.0));
@@ -270,15 +270,19 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some((prev_x, prev_y)) = self.mouse_drag {
-                    // Convert to normalized coordinates (-1 to 1)
+                    // Convert to normalized coordinates (-1 to 1) with sensitivity scaling
+                    const ROTATION_SENSITIVITY: f32 = 0.4; // Slower rotation
                     let prev = Vector2::new(
                         (prev_x as f32 / width as f32) * 2.0 - 1.0,
                         (prev_y as f32 / height as f32) * 2.0 - 1.0,
                     );
-                    let curr = Vector2::new(
+                    let curr_raw = Vector2::new(
                         (event.column as f32 / width as f32) * 2.0 - 1.0,
                         (event.row as f32 / height as f32) * 2.0 - 1.0,
                     );
+                    // Scale the delta for slower rotation
+                    let delta = (curr_raw - prev) * ROTATION_SENSITIVITY;
+                    let curr = prev + delta;
                     self.camera.trackball_rotate(prev, curr);
                     self.mouse_drag = Some((event.column, event.row));
                 }
@@ -1088,7 +1092,7 @@ fn run_loop(
 
         // Auto-spin
         if app.auto_spin {
-            let rotation_delta = Vector2::new(0.01, 0.0);
+            let rotation_delta = Vector2::new(0.004, 0.0);
             app.camera.trackball_rotate(Vector2::zeros(), rotation_delta);
         }
 
