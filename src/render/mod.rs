@@ -1,0 +1,140 @@
+//! Rendering engine for molecular structures
+//!
+//! This module handles:
+//! - Camera and projection transforms
+//! - Braille character rasterization
+//! - Different molecular representations
+
+mod camera;
+pub mod braille;
+mod pixel;
+
+pub use camera::Camera;
+pub use pixel::PixelBuffer;
+
+/// Representation style for rendering molecules
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Representation {
+    /// Backbone trace (Cα for proteins, P for nucleic acids)
+    Backbone,
+    /// Ball-and-stick (atoms as spheres, bonds as cylinders)
+    BallAndStick,
+    /// Cartoon/ribbon (secondary structure visualization)
+    #[default]
+    Cartoon,
+    /// Solvent excluded surface
+    Surface,
+}
+
+impl Representation {
+    /// Cycle to the next representation
+    pub fn next(self) -> Self {
+        match self {
+            Representation::Backbone => Representation::BallAndStick,
+            Representation::BallAndStick => Representation::Cartoon,
+            Representation::Cartoon => Representation::Surface,
+            Representation::Surface => Representation::Backbone,
+        }
+    }
+
+    /// Get the name of this representation
+    pub fn name(&self) -> &'static str {
+        match self {
+            Representation::Backbone => "Backbone",
+            Representation::BallAndStick => "Ball-and-Stick",
+            Representation::Cartoon => "Cartoon",
+            Representation::Surface => "Surface",
+        }
+    }
+}
+
+/// Color scheme for rendering molecules
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    /// Distinct color per chain
+    #[default]
+    Chain,
+    /// N-terminus (blue) to C-terminus (red) gradient
+    Rainbow,
+    /// Helix=magenta, Sheet=yellow, Coil=white
+    SecondaryStructure,
+}
+
+impl ColorScheme {
+    /// Cycle to the next color scheme
+    pub fn next(self) -> Self {
+        match self {
+            ColorScheme::Chain => ColorScheme::Rainbow,
+            ColorScheme::Rainbow => ColorScheme::SecondaryStructure,
+            ColorScheme::SecondaryStructure => ColorScheme::Chain,
+        }
+    }
+
+    /// Get the name of this color scheme
+    pub fn name(&self) -> &'static str {
+        match self {
+            ColorScheme::Chain => "Chain",
+            ColorScheme::Rainbow => "Rainbow",
+            ColorScheme::SecondaryStructure => "Secondary Structure",
+        }
+    }
+}
+
+/// Get a color for a chain identifier
+pub fn chain_color(chain_id: char) -> (u8, u8, u8) {
+    // High-contrast categorical palette
+    const CHAIN_COLORS: [(u8, u8, u8); 10] = [
+        (255, 0, 0),     // A - Red
+        (0, 0, 255),     // B - Blue
+        (0, 255, 0),     // C - Green
+        (255, 255, 0),   // D - Yellow
+        (255, 0, 255),   // E - Magenta
+        (0, 255, 255),   // F - Cyan
+        (255, 128, 0),   // G - Orange
+        (128, 0, 255),   // H - Purple
+        (0, 255, 128),   // I - Spring green
+        (255, 128, 128), // J - Light red
+    ];
+
+    let idx = match chain_id {
+        'A'..='J' => (chain_id as u8 - b'A') as usize,
+        'a'..='j' => (chain_id as u8 - b'a') as usize,
+        _ => 0,
+    };
+
+    CHAIN_COLORS[idx % CHAIN_COLORS.len()]
+}
+
+/// Get a rainbow color based on position (0.0 to 1.0)
+pub fn rainbow_color(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+
+    // Blue (0.0) -> Cyan -> Green -> Yellow -> Red (1.0)
+    let r: u8;
+    let g: u8;
+    let b: u8;
+
+    if t < 0.25 {
+        let f = t * 4.0;
+        r = 0;
+        g = (255.0 * f) as u8;
+        b = 255;
+    } else if t < 0.5 {
+        let f = (t - 0.25) * 4.0;
+        r = 0;
+        g = 255;
+        b = (255.0 * (1.0 - f)) as u8;
+    } else if t < 0.75 {
+        let f = (t - 0.5) * 4.0;
+        r = (255.0 * f) as u8;
+        g = 255;
+        b = 0;
+    } else {
+        let f = (t - 0.75) * 4.0;
+        r = 255;
+        g = (255.0 * (1.0 - f)) as u8;
+        b = 0;
+    }
+
+    (r, g, b)
+}
