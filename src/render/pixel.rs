@@ -3,6 +3,263 @@
 //! Stores per-pixel color and depth for image and half-block outputs.
 
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const SUBPIXEL_Q: i32 = 4; // Quarter-pixel offsets for LUT reuse.
+const RADIUS_Q: i32 = 4; // Quarter-pixel radius quantization.
+const CYLINDER_PROFILE_SAMPLES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SphereLutKey {
+    radius_q: i32,
+    sub_x: u8,
+    sub_y: u8,
+}
+
+#[derive(Debug, Clone)]
+struct SphereLutRow {
+    dy: i32,
+    x_start: i32,
+    len: usize,
+    offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SphereLut {
+    rows: Vec<SphereLutRow>,
+    z: Vec<f32>,
+    base_mul: Vec<f32>,
+    spec: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CylinderProfileKey {
+    radius_q: i32,
+}
+
+#[derive(Debug, Clone)]
+struct CylinderProfile {
+    radius: f32,
+    inv_r2: f32,
+    nz: Vec<f32>,
+    radial: Vec<f32>,
+    inv_dist: Vec<f32>,
+    spec: Vec<f32>,
+    z_offset: Vec<f32>,
+}
+
+fn sphere_lut_cache() -> &'static Mutex<HashMap<SphereLutKey, Arc<SphereLut>>> {
+    static CACHE: OnceLock<Mutex<HashMap<SphereLutKey, Arc<SphereLut>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cylinder_profile_cache() -> &'static Mutex<HashMap<CylinderProfileKey, Arc<CylinderProfile>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CylinderProfileKey, Arc<CylinderProfile>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_sphere_lut(key: SphereLutKey) -> Arc<SphereLut> {
+    {
+        let cache = sphere_lut_cache();
+        let map = cache.lock().unwrap();
+        if let Some(lut) = map.get(&key) {
+            return Arc::clone(lut);
+        }
+    }
+
+    let lut = Arc::new(build_sphere_lut(key));
+    let cache = sphere_lut_cache();
+    let mut map = cache.lock().unwrap();
+    map.insert(key, Arc::clone(&lut));
+    lut
+}
+
+fn get_cylinder_profile(key: CylinderProfileKey) -> Arc<CylinderProfile> {
+    {
+        let cache = cylinder_profile_cache();
+        let map = cache.lock().unwrap();
+        if let Some(profile) = map.get(&key) {
+            return Arc::clone(profile);
+        }
+    }
+
+    let profile = Arc::new(build_cylinder_profile(key));
+    let cache = cylinder_profile_cache();
+    let mut map = cache.lock().unwrap();
+    map.insert(key, Arc::clone(&profile));
+    profile
+}
+
+fn quantize_subpixel(value: f32) -> (i32, u8) {
+    let mut base = value.floor() as i32;
+    let frac = value - base as f32;
+    let mut q = ((frac * SUBPIXEL_Q as f32) + 0.5).floor() as i32;
+    if q >= SUBPIXEL_Q {
+        q = 0;
+        base += 1;
+    }
+    (base, q as u8)
+}
+
+fn quantize_radius(radius: f32) -> i32 {
+    (radius * RADIUS_Q as f32).round().max(1.0) as i32
+}
+
+fn build_sphere_lut(key: SphereLutKey) -> SphereLut {
+    // 3-light rig for professional look (like PyMOL/ChimeraX):
+    // Key light: main directional light from upper-left-front
+    // Fill light: softer light from lower-right to fill shadows
+    // Rim light: backlight for edge definition
+
+    // Key light (warm, strong) - upper left front (normalized)
+    const KEY_DIR: (f32, f32, f32) = (0.408, -0.511, 0.776);
+    // Half-vector for Blinn-Phong: H = normalize(L + V), V = (0,0,1)
+    const KEY_HALF: (f32, f32, f32) = (0.216, -0.270, 0.938);
+    const KEY_INTENSITY: f32 = 0.65;
+
+    // Fill light (cool, softer) - lower right
+    const FILL_DIR: (f32, f32, f32) = (-0.5, 0.3, 0.81);
+    const FILL_INTENSITY: f32 = 0.25;
+
+    // Rim/back light - from behind for edge highlights
+    const RIM_DIR: (f32, f32, f32) = (0.0, 0.2, -0.98);
+    const RIM_INTENSITY: f32 = 0.3;
+
+    let radius = key.radius_q as f32 / RADIUS_Q as f32;
+    let r2 = radius * radius;
+    let r_int = radius.ceil().max(1.0) as i32;
+    let off_x = key.sub_x as f32 / SUBPIXEL_Q as f32;
+    let off_y = key.sub_y as f32 / SUBPIXEL_Q as f32;
+
+    let mut rows = Vec::new();
+    let mut z = Vec::new();
+    let mut base_mul = Vec::new();
+    let mut spec = Vec::new();
+
+    let inv_r = 1.0 / radius;
+    for dy_i in -r_int..=r_int {
+        let dy = dy_i as f32 - off_y;
+        let dy2 = dy * dy;
+        if dy2 > r2 {
+            continue;
+        }
+
+        let max_dx = (r2 - dy2).sqrt();
+        let x_start = (off_x - max_dx).ceil() as i32;
+        let x_end = (off_x + max_dx).floor() as i32;
+        if x_end < x_start {
+            continue;
+        }
+
+        let len = (x_end - x_start + 1) as usize;
+        let offset = z.len();
+        rows.push(SphereLutRow {
+            dy: dy_i,
+            x_start,
+            len,
+            offset,
+        });
+
+        for dx_i in x_start..=x_end {
+            let dx = dx_i as f32 - off_x;
+            let d2 = dx * dx + dy2;
+            let dz = (r2 - d2).max(0.0).sqrt();
+            let nx = dx * inv_r;
+            let ny = dy * inv_r;
+            let nz = dz * inv_r;
+
+            // Key light contribution (with specular)
+            let key_dot = (nx * KEY_DIR.0 + ny * KEY_DIR.1 + nz * KEY_DIR.2).max(0.0);
+            let key_diffuse = KEY_INTENSITY * key_dot;
+
+            // Key specular (Blinn-Phong)
+            let n_dot_h = (nx * KEY_HALF.0 + ny * KEY_HALF.1 + nz * KEY_HALF.2).max(0.0);
+            let spec2 = n_dot_h * n_dot_h;
+            let spec4 = spec2 * spec2;
+            let spec8 = spec4 * spec4;
+            let spec16 = spec8 * spec8;
+            let spec32 = spec16 * spec16;
+            let key_spec = if key_dot > 0.0 { 0.4 * spec32 } else { 0.0 };
+
+            // Fill light contribution (no specular, just soft fill)
+            let fill_dot = (nx * FILL_DIR.0 + ny * FILL_DIR.1 + nz * FILL_DIR.2).max(0.0);
+            let fill_diffuse = FILL_INTENSITY * fill_dot;
+
+            // Rim light - Fresnel-like effect for edge highlighting
+            let rim_dot = (nx * RIM_DIR.0 + ny * RIM_DIR.1 + nz * RIM_DIR.2).max(0.0);
+            let fresnel = 1.0 - nz; // Stronger at edges
+            let rim_contrib = RIM_INTENSITY * rim_dot * fresnel * fresnel;
+
+            // Ambient occlusion approximation - darken edges where nz is low
+            let edge_darken = (1.0 - nz) * 0.12;
+
+            // Combine all lighting
+            let ambient = 0.15;
+            let total_diffuse = ambient + key_diffuse + fill_diffuse + rim_contrib - edge_darken;
+            let base = total_diffuse.min(1.0);
+
+            // Combined specular
+            let specular = key_spec;
+
+            z.push(dz);
+            base_mul.push(base);
+            spec.push(specular);
+        }
+    }
+
+    SphereLut {
+        rows,
+        z,
+        base_mul,
+        spec,
+    }
+}
+
+fn build_cylinder_profile(key: CylinderProfileKey) -> CylinderProfile {
+    let radius = key.radius_q as f32 / RADIUS_Q as f32;
+    let inv_r2 = 1.0 / (radius * radius);
+    let mut nz = Vec::with_capacity(CYLINDER_PROFILE_SAMPLES);
+    let mut radial = Vec::with_capacity(CYLINDER_PROFILE_SAMPLES);
+    let mut inv_dist = Vec::with_capacity(CYLINDER_PROFILE_SAMPLES);
+    let mut spec = Vec::with_capacity(CYLINDER_PROFILE_SAMPLES);
+    let mut z_offset = Vec::with_capacity(CYLINDER_PROFILE_SAMPLES);
+
+    for i in 0..CYLINDER_PROFILE_SAMPLES {
+        let t = if CYLINDER_PROFILE_SAMPLES > 1 {
+            i as f32 / (CYLINDER_PROFILE_SAMPLES - 1) as f32
+        } else {
+            0.0
+        };
+        let nz_val = (1.0 - t).max(0.0).sqrt();
+        // radial component: sqrt(1 - nz²) = sqrt(t) for unit normal
+        let radial_val = t.sqrt();
+        let inv_dist_val = if t > 0.0 {
+            1.0 / (radius * t.sqrt())
+        } else {
+            0.0
+        };
+        let spec_val = 0.2 * (nz_val * nz_val).powi(2);
+        let z_val = nz_val * radius * 0.3;
+
+        nz.push(nz_val);
+        radial.push(radial_val);
+        inv_dist.push(inv_dist_val);
+        spec.push(spec_val);
+        z_offset.push(z_val);
+    }
+
+    CylinderProfile {
+        radius,
+        inv_r2,
+        nz,
+        radial,
+        inv_dist,
+        spec,
+        z_offset,
+    }
+}
 
 /// Precomputed sRGB to linear lookup table (256 entries)
 /// Eliminates expensive pow() calls in hot paths
@@ -198,6 +455,30 @@ impl PixelBuffer {
         }
     }
 
+    /// Copy a smaller buffer into this one at a given offset.
+    pub fn blit_from(&mut self, src: &PixelBuffer, dst_x: usize, dst_y: usize) {
+        debug_assert!(dst_x + src.width <= self.width);
+        debug_assert!(dst_y + src.height <= self.height);
+
+        for y in 0..src.height {
+            let dst_row = (dst_y + y) * self.width + dst_x;
+            let src_row = y * src.width;
+            for x in 0..src.width {
+                let src_idx = src_row + x;
+                let dst_idx = dst_row + x;
+                let src_color = src.colors[src_idx];
+                if src_color.3 == 0 {
+                    continue;
+                }
+                let src_depth = src.depth[src_idx];
+                if src_depth > self.depth[dst_idx] {
+                    self.colors[dst_idx] = src_color;
+                    self.depth[dst_idx] = src_depth;
+                }
+            }
+        }
+    }
+
     /// Get a pixel's RGBA value.
     pub fn get_pixel(&self, x: usize, y: usize) -> (u8, u8, u8, u8) {
         if x >= self.width || y >= self.height {
@@ -251,7 +532,8 @@ impl PixelBuffer {
         }
     }
 
-    /// Draw a filled circle (flat shading).
+    /// Draw a filled circle (flat shading) - LUT-based for performance.
+    /// Reuses sphere LUT span structure but with flat color (no shading math).
     pub fn draw_circle(
         &mut self,
         cx: f32,
@@ -260,18 +542,59 @@ impl PixelBuffer {
         radius: f32,
         color: (u8, u8, u8),
     ) {
-        let r = radius.max(0.5) as i32;
-        let r_sq = (radius * radius) as i32;
+        if radius < 1.2 {
+            self.set_pixel(cx as i32, cy as i32, cz, color);
+            return;
+        }
 
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy <= r_sq {
-                    let x = cx as i32 + dx;
-                    let y = cy as i32 + dy;
-                    let dist = ((dx * dx + dy * dy) as f32).sqrt();
-                    let z_offset = (1.0 - dist / radius).max(0.0) * 0.5;
-                    self.set_pixel(x, y, cz + z_offset, color);
+        // Reuse sphere LUT infrastructure for span-based circle rendering
+        // This avoids per-pixel sqrt and leverages cached LUT data
+        let radius_q = quantize_radius(radius);
+        let (cx_base, sub_x) = quantize_subpixel(cx);
+        let (cy_base, sub_y) = quantize_subpixel(cy);
+        let lut = get_sphere_lut(SphereLutKey { radius_q, sub_x, sub_y });
+
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let color_rgba = (color.0, color.1, color.2, 255u8);
+
+        for row in &lut.rows {
+            let y = cy_base + row.dy;
+            if y < 0 || y >= height {
+                continue;
+            }
+
+            let mut x0 = cx_base + row.x_start;
+            let mut x1 = x0 + row.len as i32;
+            if x1 <= 0 || x0 >= width {
+                continue;
+            }
+
+            let mut skip = 0usize;
+            if x0 < 0 {
+                skip = (-x0) as usize;
+                x0 = 0;
+            }
+            if x1 > width {
+                x1 = width;
+            }
+            if x0 >= x1 {
+                continue;
+            }
+
+            let mut src_idx = row.offset + skip;
+            let mut dst_idx = y as usize * self.width + x0 as usize;
+            let count = (x1 - x0) as usize;
+
+            // Use LUT z values scaled down for flat circle depth (similar curve to old impl)
+            for _ in 0..count {
+                let z = cz + lut.z[src_idx] * 0.5;
+                if z > self.depth[dst_idx] {
+                    self.colors[dst_idx] = color_rgba;
+                    self.depth[dst_idx] = z;
                 }
+                src_idx += 1;
+                dst_idx += 1;
             }
         }
     }
@@ -290,71 +613,62 @@ impl PixelBuffer {
             return;
         }
 
-        // Pre-convert base color to linear (0-1)
+        let radius_q = quantize_radius(radius);
+        let (cx_base, sub_x) = quantize_subpixel(cx);
+        let (cy_base, sub_y) = quantize_subpixel(cy);
+        let lut = get_sphere_lut(SphereLutKey {
+            radius_q,
+            sub_x,
+            sub_y,
+        });
+
         let br = base_color.0 as f32 / 255.0;
         let bg = base_color.1 as f32 / 255.0;
         let bb = base_color.2 as f32 / 255.0;
+        let width = self.width as i32;
+        let height = self.height as i32;
 
-        // Pre-computed light direction (normalized): upper-left-front
-        const LIGHT: (f32, f32, f32) = (0.408, -0.511, 0.776);
-        const HALF: (f32, f32, f32) = (0.230, -0.288, 1.0); // Unnormalized, will use dot directly
+        for row in &lut.rows {
+            let y = cy_base + row.dy;
+            if y < 0 || y >= height {
+                continue;
+            }
 
-        let r2 = radius * radius;
-        let inv_r = 1.0 / radius;
-        let min_x = (cx - radius).floor() as i32;
-        let max_x = (cx + radius).ceil() as i32;
-        let min_y = (cy - radius).floor() as i32;
-        let max_y = (cy + radius).ceil() as i32;
+            let mut x0 = cx_base + row.x_start;
+            let mut x1 = x0 + row.len as i32;
+            if x1 <= 0 || x0 >= width {
+                continue;
+            }
 
-        for y in min_y..=max_y {
-            let dy = (y as f32 + 0.5) - cy;
-            let dy2 = dy * dy;
+            let mut skip = 0usize;
+            if x0 < 0 {
+                skip = (-x0) as usize;
+                x0 = 0;
+            }
+            if x1 > width {
+                x1 = width;
+            }
+            if x0 >= x1 {
+                continue;
+            }
 
-            for x in min_x..=max_x {
-                let dx = (x as f32 + 0.5) - cx;
-                let d2 = dx * dx + dy2;
+            let mut src_idx = row.offset + skip;
+            let mut dst_idx = y as usize * self.width + x0 as usize;
+            let count = (x1 - x0) as usize;
 
-                if d2 > r2 {
-                    continue;
+            for _ in 0..count {
+                let z = cz + lut.z[src_idx];
+                if z > self.depth[dst_idx] {
+                    let base = lut.base_mul[src_idx];
+                    let spec = lut.spec[src_idx];
+                    let r = (br * base + spec).min(1.0);
+                    let g = (bg * base + spec).min(1.0);
+                    let b = (bb * base + spec).min(1.0);
+                    self.colors[dst_idx] = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255);
+                    self.depth[dst_idx] = z;
                 }
-
-                let dz = (r2 - d2).sqrt();
-                let z = cz + dz;
-
-                // Normal (already unit length since on sphere)
-                let nx = dx * inv_r;
-                let ny = dy * inv_r;
-                let nz = dz * inv_r;
-
-                // Diffuse (Lambert)
-                let n_dot_l = (nx * LIGHT.0 + ny * LIGHT.1 + nz * LIGHT.2).max(0.0);
-
-                // Fast specular: (n·h)^32 ≈ x^4^4^2 using repeated squaring
-                let n_dot_h = (nx * HALF.0 + ny * HALF.1 + nz * HALF.2).max(0.0);
-                let spec2 = n_dot_h * n_dot_h;
-                let spec4 = spec2 * spec2;
-                let spec8 = spec4 * spec4;
-                let spec16 = spec8 * spec8;
-                let spec32 = spec16 * spec16;
-                let specular = if n_dot_l > 0.0 { 0.35 * spec32 } else { 0.0 };
-
-                // Simple rim: (1-nz)^2
-                let rim_t = 1.0 - nz;
-                let rim = 0.15 * rim_t * rim_t;
-
-                // Combine: ambient + diffuse + specular + rim
-                let shade = 0.15 + 0.70 * n_dot_l;
-                let r = (br * shade + specular + rim * br).min(1.0);
-                let g = (bg * shade + specular + rim * bg).min(1.0);
-                let b = (bb * shade + specular + rim * bb).min(1.0);
-
-                let color = (
-                    (r * 255.0) as u8,
-                    (g * 255.0) as u8,
-                    (b * 255.0) as u8,
-                );
-
-                self.set_pixel(x, y, z, color);
+                src_idx += 1;
+                dst_idx += 1;
             }
         }
     }
@@ -373,92 +687,102 @@ impl PixelBuffer {
     ) {
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let dz = z1 - z0;
-        let length_sq = dx * dx + dy * dy + dz * dz;
-
-        if length_sq < 0.01 {
+        let len2 = dx * dx + dy * dy;
+        if len2 < 0.001 {
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let cz = z0.max(z1);
+            self.draw_sphere_shaded(cx, cy, cz, radius, color);
             return;
         }
+        let inv_len2 = 1.0 / len2;
 
-        let length = length_sq.sqrt();
-        let inv_len = 1.0 / length;
+        let radius_q = quantize_radius(radius);
+        let profile = get_cylinder_profile(CylinderProfileKey { radius_q });
+        let r = profile.radius;
+        let r2 = r * r;
 
-        // Cylinder axis direction
-        let ax = dx * inv_len;
-        let ay = dy * inv_len;
-        let az = dz * inv_len;
-
-        // Pre-convert color
         let br = color.0 as f32 / 255.0;
         let bg = color.1 as f32 / 255.0;
         let bb = color.2 as f32 / 255.0;
 
-        // Light direction (pre-normalized)
-        const LIGHT: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        // 3-light rig matching sphere shading (normalized vectors)
+        const KEY_DIR: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        const KEY_HALF: (f32, f32, f32) = (0.216, -0.270, 0.938);
+        const FILL_DIR: (f32, f32, f32) = (-0.5, 0.3, 0.81);
+        const RIM_DIR: (f32, f32, f32) = (0.0, 0.2, -0.98);
 
-        // 2D bounding box in screen space
-        let min_x = (x0.min(x1) - radius).floor() as i32;
-        let max_x = (x0.max(x1) + radius).ceil() as i32;
-        let min_y = (y0.min(y1) - radius).floor() as i32;
-        let max_y = (y0.max(y1) + radius).ceil() as i32;
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let mut min_x = (x0.min(x1) - r).floor() as i32;
+        let mut max_x = (x0.max(x1) + r).ceil() as i32;
+        let mut min_y = (y0.min(y1) - r).floor() as i32;
+        let mut max_y = (y0.max(y1) + r).ceil() as i32;
 
-        let r2 = radius * radius;
+        min_x = min_x.max(0);
+        min_y = min_y.max(0);
+        max_x = max_x.min(width - 1);
+        max_y = max_y.min(height - 1);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
 
         for y in min_y..=max_y {
             let py = y as f32 + 0.5;
-
             for x in min_x..=max_x {
                 let px = x as f32 + 0.5;
-
-                // Vector from p0 to pixel
                 let vx = px - x0;
                 let vy = py - y0;
+                let t_axis = (vx * dx + vy * dy) * inv_len2;
+                let t_axis = t_axis.clamp(0.0, 1.0);
 
-                // Project onto cylinder axis: t = (v · axis)
-                let t = (vx * ax + vy * ay).clamp(0.0, length);
+                let closest_x = x0 + dx * t_axis;
+                let closest_y = y0 + dy * t_axis;
 
-                // Closest point on axis to pixel
-                let closest_x = x0 + ax * t;
-                let closest_y = y0 + ay * t;
-                let closest_z = z0 + az * t;
-
-                // Distance from pixel to axis (in 2D)
                 let dist_x = px - closest_x;
                 let dist_y = py - closest_y;
                 let dist_sq = dist_x * dist_x + dist_y * dist_y;
-
                 if dist_sq > r2 {
                     continue;
                 }
 
-                // Calculate z on cylinder surface
-                let dist = dist_sq.sqrt();
-                let surface_z = if dist < radius {
-                    closest_z + (r2 - dist_sq).sqrt() * 0.3
-                } else {
-                    closest_z
-                };
+                let t_rad = (dist_sq * profile.inv_r2).min(1.0);
+                let idx = ((t_rad * (CYLINDER_PROFILE_SAMPLES as f32 - 1.0)) as usize)
+                    .min(CYLINDER_PROFILE_SAMPLES - 1);
 
-                // Normal: points from axis to surface point
-                let (nx, ny, nz) = if dist > 0.001 {
-                    let inv_d = 1.0 / dist;
-                    let nz_contrib = if dist < radius { (r2 - dist_sq).sqrt() / radius } else { 0.0 };
-                    (dist_x * inv_d * (1.0 - nz_contrib), dist_y * inv_d * (1.0 - nz_contrib), nz_contrib)
-                } else {
-                    (0.0, 0.0, 1.0)
-                };
+                let nz = profile.nz[idx];
+                let radial = profile.radial[idx];
+                let inv_dist = profile.inv_dist[idx];
+                let nx = dist_x * inv_dist * radial;
+                let ny = dist_y * inv_dist * radial;
 
-                // Diffuse lighting
-                let n_dot_l = (nx * LIGHT.0 + ny * LIGHT.1 + nz * LIGHT.2).max(0.0);
-                let shade = 0.20 + 0.65 * n_dot_l;
+                // Key light (main diffuse + specular)
+                let key_dot = (nx * KEY_DIR.0 + ny * KEY_DIR.1 + nz * KEY_DIR.2).max(0.0);
+                let key_diffuse = 0.65 * key_dot;
 
-                // Simple specular
-                let spec = if n_dot_l > 0.0 && nz > 0.3 {
-                    let spec_t = nz * nz;
-                    0.2 * spec_t * spec_t
-                } else {
-                    0.0
-                };
+                // Key specular
+                let n_dot_h = (nx * KEY_HALF.0 + ny * KEY_HALF.1 + nz * KEY_HALF.2).max(0.0);
+                let spec_pow = n_dot_h * n_dot_h;
+                let spec_pow = spec_pow * spec_pow; // ^4
+                let spec_pow = spec_pow * spec_pow; // ^8
+                let spec_pow = spec_pow * spec_pow; // ^16
+                let spec_pow = spec_pow * spec_pow; // ^32
+                let spec = if key_dot > 0.0 && nz > 0.2 { 0.35 * spec_pow } else { 0.0 };
+
+                // Fill light (soft fill from opposite side)
+                let fill_dot = (nx * FILL_DIR.0 + ny * FILL_DIR.1 + nz * FILL_DIR.2).max(0.0);
+                let fill_diffuse = 0.25 * fill_dot;
+
+                // Rim light (edge highlighting)
+                let rim_dot = (nx * RIM_DIR.0 + ny * RIM_DIR.1 + nz * RIM_DIR.2).max(0.0);
+                let fresnel = 1.0 - nz;
+                let rim = 0.25 * rim_dot * fresnel * fresnel;
+
+                // Combine lighting
+                let ambient = 0.12;
+                let shade = ambient + key_diffuse + fill_diffuse + rim + nz * 0.1;
+
+                let surface_z = z0 + (z1 - z0) * t_axis + profile.z_offset[idx];
 
                 let r = ((br * shade + spec).min(1.0) * 255.0) as u8;
                 let g = ((bg * shade + spec).min(1.0) * 255.0) as u8;
@@ -538,44 +862,61 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
     }
 
     let src_width = src.width();
+    let mut dst = PixelBuffer::new(dst_width, dst_height);
 
-    // Compute each row in parallel
-    let results: Vec<(Vec<(u8, u8, u8, u8)>, Vec<f32>)> = (0..dst_height)
-        .into_par_iter()
-        .map(|y| {
-            let mut row_colors = Vec::with_capacity(dst_width);
-            let mut row_depths = Vec::with_capacity(dst_width);
+    dst.colors
+        .par_chunks_mut(dst_width)
+        .zip(dst.depth.par_chunks_mut(dst_width))
+        .enumerate()
+        .for_each(|(y, (row_colors, row_depths))| {
+            let sy0 = y * 2;
+            let sy1 = sy0 + 1;
+            let row0 = sy0 * src_width;
+            let row1 = sy1 * src_width;
 
             for x in 0..dst_width {
-                // Linear-space accumulation with alpha weighting
-                let mut r_lin: f32 = 0.0;
-                let mut g_lin: f32 = 0.0;
-                let mut b_lin: f32 = 0.0;
-                let mut a_sum: f32 = 0.0;
-                let mut max_z = f32::NEG_INFINITY;
+                let sx0 = x * 2;
+                let idx0 = row0 + sx0;
+                let idx1 = idx0 + 1;
+                let idx2 = row1 + sx0;
+                let idx3 = idx2 + 1;
 
-                // Sample 2x2 block
-                for oy in 0..2 {
-                    for ox in 0..2 {
-                        let sx = x * 2 + ox;
-                        let sy = y * 2 + oy;
-                        let (r, g, b, a) = src.get_pixel(sx, sy);
+                let (r0, g0, b0, a0) = src.colors[idx0];
+                let (r1, g1, b1, a1) = src.colors[idx1];
+                let (r2, g2, b2, a2) = src.colors[idx2];
+                let (r3, g3, b3, a3) = src.colors[idx3];
 
-                        // Convert to linear space and weight by alpha
-                        let alpha = a as f32 / 255.0;
-                        r_lin += srgb_to_linear(r) * alpha;
-                        g_lin += srgb_to_linear(g) * alpha;
-                        b_lin += srgb_to_linear(b) * alpha;
-                        a_sum += alpha;
+                let mut r_lin = 0.0;
+                let mut g_lin = 0.0;
+                let mut b_lin = 0.0;
+                let mut a_sum = 0.0;
+                let max_z = src.depth[idx0].max(src.depth[idx1]).max(src.depth[idx2]).max(src.depth[idx3]);
 
-                        let idx = sy * src_width + sx;
-                        if idx < src.depth.len() && src.depth[idx] > max_z {
-                            max_z = src.depth[idx];
-                        }
-                    }
-                }
+                let alpha0 = a0 as f32 / 255.0;
+                let alpha1 = a1 as f32 / 255.0;
+                let alpha2 = a2 as f32 / 255.0;
+                let alpha3 = a3 as f32 / 255.0;
 
-                // Normalize and convert back to sRGB
+                r_lin += srgb_to_linear(r0) * alpha0;
+                g_lin += srgb_to_linear(g0) * alpha0;
+                b_lin += srgb_to_linear(b0) * alpha0;
+                a_sum += alpha0;
+
+                r_lin += srgb_to_linear(r1) * alpha1;
+                g_lin += srgb_to_linear(g1) * alpha1;
+                b_lin += srgb_to_linear(b1) * alpha1;
+                a_sum += alpha1;
+
+                r_lin += srgb_to_linear(r2) * alpha2;
+                g_lin += srgb_to_linear(g2) * alpha2;
+                b_lin += srgb_to_linear(b2) * alpha2;
+                a_sum += alpha2;
+
+                r_lin += srgb_to_linear(r3) * alpha3;
+                g_lin += srgb_to_linear(g3) * alpha3;
+                b_lin += srgb_to_linear(b3) * alpha3;
+                a_sum += alpha3;
+
                 let (r, g, b, a) = if a_sum > 0.0 {
                     (
                         linear_to_srgb(r_lin / a_sum),
@@ -587,23 +928,10 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
                     (0, 0, 0, 0)
                 };
 
-                row_colors.push((r, g, b, a));
-                row_depths.push(max_z);
+                row_colors[x] = (r, g, b, a);
+                row_depths[x] = max_z;
             }
-
-            (row_colors, row_depths)
-        })
-        .collect();
-
-    // Assemble the final buffer
-    let mut dst = PixelBuffer::new(dst_width, dst_height);
-    for (y, (row_colors, row_depths)) in results.into_iter().enumerate() {
-        for (x, (color, depth)) in row_colors.into_iter().zip(row_depths).enumerate() {
-            let idx = y * dst_width + x;
-            dst.colors[idx] = color;
-            dst.depth[idx] = depth;
-        }
-    }
+        });
 
     dst
 }
@@ -637,41 +965,35 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, _threshol
     // Normalized threshold: detect edges at ~2% of depth range
     let norm_threshold = depth_range * 0.02;
 
-    // Compute edge factors in parallel (one row at a time)
-    let edge_factors: Vec<f32> = (0..height)
-        .into_par_iter()
-        .flat_map(|y| {
-            let mut row = vec![0.0_f32; width];
+    let colors = &buffer.colors;
+    let depth = &buffer.depth;
+    let mut edge_factors = vec![0.0_f32; width * height];
 
-            // Skip first and last rows (boundary)
-            if y == 0 || y == height - 1 {
-                return row;
+    edge_factors
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            if y == 0 || y + 1 >= height {
+                return;
             }
 
             for x in 1..width - 1 {
                 let idx = y * width + x;
-
-                // Skip transparent pixels
-                if buffer.colors[idx].3 == 0 {
+                if colors[idx].3 == 0 {
                     continue;
                 }
 
-                let center_depth = buffer.depth[idx];
-
-                // Skip if center is background (shouldn't happen since we check alpha)
+                let center_depth = depth[idx];
                 if center_depth <= f32::NEG_INFINITY {
                     continue;
                 }
 
-                // Sample 3x3 neighborhood depths, treating background as center depth
-                // to avoid halos at object boundaries
                 let sample = |dx: i32, dy: i32| -> f32 {
                     let nx = (x as i32 + dx) as usize;
                     let ny = (y as i32 + dy) as usize;
                     let n_idx = ny * width + nx;
-                    let n_alpha = buffer.colors[n_idx].3;
-                    let n_depth = buffer.depth[n_idx];
-                    // If neighbor is background/transparent, use center depth
+                    let n_alpha = colors[n_idx].3;
+                    let n_depth = depth[n_idx];
                     if n_alpha == 0 || n_depth <= f32::NEG_INFINITY {
                         center_depth
                     } else {
@@ -680,40 +1002,44 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, _threshol
                 };
 
                 let d_tl = sample(-1, -1);
-                let d_t  = sample(0, -1);
+                let d_t = sample(0, -1);
                 let d_tr = sample(1, -1);
-                let d_l  = sample(-1, 0);
-                let d_r  = sample(1, 0);
+                let d_l = sample(-1, 0);
+                let d_r = sample(1, 0);
                 let d_bl = sample(-1, 1);
-                let d_b  = sample(0, 1);
+                let d_b = sample(0, 1);
                 let d_br = sample(1, 1);
 
-                // Sobel gradient (horizontal and vertical)
                 let gx = (d_tr + 2.0 * d_r + d_br) - (d_tl + 2.0 * d_l + d_bl);
                 let gy = (d_bl + 2.0 * d_b + d_br) - (d_tl + 2.0 * d_t + d_tr);
-
-                // Gradient magnitude normalized to depth range
                 let gradient = (gx * gx + gy * gy).sqrt();
 
-                // Also detect edges between objects at different depths
-                let max_neighbor = d_tl.max(d_t).max(d_tr).max(d_l).max(d_r).max(d_bl).max(d_b).max(d_br);
-                let min_neighbor = d_tl.min(d_t).min(d_tr).min(d_l).min(d_r).min(d_bl).min(d_b).min(d_br);
+                let max_neighbor = d_tl
+                    .max(d_t)
+                    .max(d_tr)
+                    .max(d_l)
+                    .max(d_r)
+                    .max(d_bl)
+                    .max(d_b)
+                    .max(d_br);
+                let min_neighbor = d_tl
+                    .min(d_t)
+                    .min(d_tr)
+                    .min(d_l)
+                    .min(d_r)
+                    .min(d_bl)
+                    .min(d_b)
+                    .min(d_br);
                 let local_range = max_neighbor - min_neighbor;
 
-                // Combine gradient and depth discontinuity
                 let edge_strength = gradient.max(local_range * 0.5);
-
                 if edge_strength > norm_threshold {
-                    // Normalize edge strength to 0-1 range, then apply strength
                     let normalized = ((edge_strength - norm_threshold) / depth_range).min(1.0);
                     let factor = (normalized * strength * 2.0).min(0.7);
                     row[x] = factor;
                 }
             }
-
-            row
-        })
-        .collect();
+        });
 
     // Apply darkening in parallel using chunks
     buffer.colors
@@ -732,6 +1058,88 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, _threshol
         });
 }
 
+/// Fast morphological anti-aliasing based on luma contrast.
+/// Smooths high-contrast edges without supersampling.
+pub fn apply_edge_aa(buffer: &mut PixelBuffer, strength: f32, threshold: f32) {
+    let width = buffer.width;
+    let height = buffer.height;
+
+    if width < 3 || height < 3 {
+        return;
+    }
+
+    let colors = &buffer.colors;
+    let mut out = buffer.colors.clone();
+
+    // Process rows in parallel
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            if y == 0 || y + 1 >= height {
+                return;
+            }
+
+            let luma = |c: (u8, u8, u8, u8)| -> f32 {
+                (0.299 * c.0 as f32 + 0.587 * c.1 as f32 + 0.114 * c.2 as f32) / 255.0
+            };
+
+            let row_idx = y * width;
+            for x in 1..width - 1 {
+                let idx = row_idx + x;
+                let c = colors[idx];
+                if c.3 == 0 {
+                    continue;
+                }
+
+                let n = colors[idx - width];
+                let s = colors[idx + width];
+                let w = colors[idx - 1];
+                let e = colors[idx + 1];
+
+                let l = luma(c);
+                let l_n = luma(n);
+                let l_s = luma(s);
+                let l_w = luma(w);
+                let l_e = luma(e);
+
+                let l_min = l.min(l_n.min(l_s).min(l_w).min(l_e));
+                let l_max = l.max(l_n.max(l_s).max(l_w).max(l_e));
+                let contrast = l_max - l_min;
+                if contrast < threshold {
+                    continue;
+                }
+
+                let horiz = (l_w - l_e).abs();
+                let vert = (l_n - l_s).abs();
+                let blend = (contrast * strength).min(0.8);
+
+                let (ar, ag, ab) = if horiz >= vert {
+                    (
+                        ((w.0 as u16 + e.0 as u16) / 2) as u8,
+                        ((w.1 as u16 + e.1 as u16) / 2) as u8,
+                        ((w.2 as u16 + e.2 as u16) / 2) as u8,
+                    )
+                } else {
+                    (
+                        ((n.0 as u16 + s.0 as u16) / 2) as u8,
+                        ((n.1 as u16 + s.1 as u16) / 2) as u8,
+                        ((n.2 as u16 + s.2 as u16) / 2) as u8,
+                    )
+                };
+
+                let inv = 1.0 - blend;
+                row_out[x] = (
+                    (c.0 as f32 * inv + ar as f32 * blend) as u8,
+                    (c.1 as f32 * inv + ag as f32 * blend) as u8,
+                    (c.2 as f32 * inv + ab as f32 * blend) as u8,
+                    c.3,
+                );
+            }
+        });
+
+    buffer.colors = out;
+}
+
 /// Fast SSAO - just 4 cardinal samples for performance
 /// Apply Screen Space Ambient Occlusion for enhanced depth perception.
 /// Optimized version using only 4 samples for terminal rendering.
@@ -746,40 +1154,38 @@ pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
     // Sample radius scaled to image size
     let r = (radius * (width.min(height) as f32 / 200.0).max(1.0)).max(2.0) as i32;
 
-    // Compute occlusion factors in parallel - simple 4-direction sampling
-    let occlusion: Vec<f32> = (0..height)
-        .into_par_iter()
-        .flat_map(|y| {
-            let mut row = vec![0.0_f32; width];
-            let yi = y as i32;
+    let colors = &buffer.colors;
+    let depth = &buffer.depth;
+    let mut occlusion = vec![0.0_f32; width * height];
 
+    occlusion
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let yi = y as i32;
             for x in 0..width {
                 let xi = x as i32;
                 let idx = y * width + x;
 
-                // Skip background pixels
-                if buffer.colors[idx].3 == 0 {
+                if colors[idx].3 == 0 {
                     continue;
                 }
 
-                let center_depth = buffer.depth[idx];
+                let center_depth = depth[idx];
                 if center_depth <= f32::NEG_INFINITY {
                     continue;
                 }
 
-                // Sample 4 cardinal directions
                 let mut occluded = 0_u8;
                 let offsets: [(i32, i32); 4] = [(r, 0), (-r, 0), (0, r), (0, -r)];
 
                 for (dx, dy) in offsets {
                     let sx = xi + dx;
                     let sy = yi + dy;
-
                     if sx >= 0 && sy >= 0 && (sx as usize) < width && (sy as usize) < height {
                         let s_idx = sy as usize * width + sx as usize;
-                        if buffer.colors[s_idx].3 > 0 {
-                            let sample_depth = buffer.depth[s_idx];
-                            // If sample is in front, we're occluded
+                        if colors[s_idx].3 > 0 {
+                            let sample_depth = depth[s_idx];
                             if sample_depth > center_depth + 0.5 {
                                 occluded += 1;
                             }
@@ -791,10 +1197,7 @@ pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
                     row[x] = (occluded as f32 * 0.15 * strength).min(0.4);
                 }
             }
-
-            row
-        })
-        .collect();
+        });
 
     // Apply darkening - simple multiply, skip sRGB conversion for speed
     buffer.colors

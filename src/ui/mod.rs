@@ -5,7 +5,7 @@
 mod output;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
-use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges};
+use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, apply_edge_aa, apply_silhouette_edges, apply_ssao, apply_tone_mapping};
 use rayon::prelude::*;
 use crossterm::{
     cursor,
@@ -65,6 +65,174 @@ impl AltLocMode {
     }
 }
 
+const TILE_SIZE: usize = 64;
+const TILE_THRESHOLD: usize = 128;
+
+#[derive(Clone, Copy)]
+struct ProjInfo {
+    x: f32,
+    y: f32,
+    z: f32,
+    size_scale: f32,
+    color: (u8, u8, u8),
+}
+
+#[derive(Clone, Copy)]
+struct Bounds {
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl Bounds {
+    fn from_circle(cx: f32, cy: f32, radius: f32) -> Self {
+        let min_x = (cx - radius).floor() as i32;
+        let max_x = (cx + radius).ceil() as i32;
+        let min_y = (cy - radius).floor() as i32;
+        let max_y = (cy + radius).ceil() as i32;
+        Self { min_x, max_x, min_y, max_y }
+    }
+
+    fn from_segment(x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) -> Self {
+        let min_x = (x0.min(x1) - radius).floor() as i32;
+        let max_x = (x0.max(x1) + radius).ceil() as i32;
+        let min_y = (y0.min(y1) - radius).floor() as i32;
+        let max_y = (y0.max(y1) + radius).ceil() as i32;
+        Self { min_x, max_x, min_y, max_y }
+    }
+
+    fn intersects(&self, other: &Bounds) -> bool {
+        !(self.max_x < other.min_x
+            || self.min_x > other.max_x
+            || self.max_y < other.min_y
+            || self.min_y > other.max_y)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Tile {
+    x0: i32,
+    y0: i32,
+    width: usize,
+    height: usize,
+}
+
+impl Tile {
+    fn bounds(&self) -> Bounds {
+        let max_x = self.x0 + self.width as i32 - 1;
+        let max_y = self.y0 + self.height as i32 - 1;
+        Bounds {
+            min_x: self.x0,
+            max_x,
+            min_y: self.y0,
+            max_y,
+        }
+    }
+}
+
+enum Primitive {
+    Sphere { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
+    Cylinder { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
+    Line { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8), bounds: Bounds },
+    Circle { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
+}
+
+impl Primitive {
+    fn sphere(x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8)) -> Self {
+        let bounds = Bounds::from_circle(x, y, radius);
+        Primitive::Sphere { x, y, z, radius, color, bounds }
+    }
+
+    fn cylinder(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8)) -> Self {
+        let bounds = Bounds::from_segment(x0, y0, x1, y1, radius);
+        Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color, bounds }
+    }
+
+    fn line(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8)) -> Self {
+        let bounds = Bounds::from_segment(x0, y0, x1, y1, 0.5);
+        Primitive::Line { x0, y0, z0, x1, y1, z1, color, bounds }
+    }
+
+    fn circle(x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8)) -> Self {
+        let bounds = Bounds::from_circle(x, y, radius);
+        Primitive::Circle { x, y, z, radius, color, bounds }
+    }
+
+    fn bounds(&self) -> Bounds {
+        match self {
+            Primitive::Sphere { bounds, .. } => *bounds,
+            Primitive::Cylinder { bounds, .. } => *bounds,
+            Primitive::Line { bounds, .. } => *bounds,
+            Primitive::Circle { bounds, .. } => *bounds,
+        }
+    }
+
+    fn draw_offset(&self, buffer: &mut PixelBuffer, offset_x: i32, offset_y: i32) {
+        let ox = offset_x as f32;
+        let oy = offset_y as f32;
+        match *self {
+            Primitive::Sphere { x, y, z, radius, color, .. } => {
+                buffer.draw_sphere_shaded(x - ox, y - oy, z, radius, color);
+            }
+            Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color, .. } => {
+                buffer.draw_cylinder_shaded(x0 - ox, y0 - oy, z0, x1 - ox, y1 - oy, z1, radius, color);
+            }
+            Primitive::Line { x0, y0, z0, x1, y1, z1, color, .. } => {
+                buffer.draw_line(x0 - ox, y0 - oy, z0, x1 - ox, y1 - oy, z1, color);
+            }
+            Primitive::Circle { x, y, z, radius, color, .. } => {
+                buffer.draw_circle(x - ox, y - oy, z, radius, color);
+            }
+        }
+    }
+}
+
+fn render_primitives_tiled(buffer: &mut PixelBuffer, primitives: &[Primitive]) {
+    if primitives.is_empty() {
+        return;
+    }
+
+    let width = buffer.width();
+    let height = buffer.height();
+    let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
+    let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+
+    let mut tiles = Vec::with_capacity(tiles_x * tiles_y);
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let x0 = (tx * TILE_SIZE) as i32;
+            let y0 = (ty * TILE_SIZE) as i32;
+            let tile_w = TILE_SIZE.min(width.saturating_sub(tx * TILE_SIZE));
+            let tile_h = TILE_SIZE.min(height.saturating_sub(ty * TILE_SIZE));
+            if tile_w == 0 || tile_h == 0 {
+                continue;
+            }
+            tiles.push(Tile { x0, y0, width: tile_w, height: tile_h });
+        }
+    }
+
+    let rendered: Vec<(usize, usize, PixelBuffer)> = tiles
+        .par_iter()
+        .map(|tile| {
+            let mut local = PixelBuffer::new(tile.width, tile.height);
+            let tile_bounds = tile.bounds();
+
+            for prim in primitives {
+                if prim.bounds().intersects(&tile_bounds) {
+                    prim.draw_offset(&mut local, tile.x0, tile.y0);
+                }
+            }
+
+            (tile.x0 as usize, tile.y0 as usize, local)
+        })
+        .collect();
+
+    for (x0, y0, local) in rendered {
+        buffer.blit_from(&local, x0, y0);
+    }
+}
+
 /// Application state
 struct App {
     /// The molecule being viewed
@@ -111,6 +279,12 @@ struct App {
     backend_changed: bool,
     /// Whether to quit
     should_quit: bool,
+    /// Last time an image was sent to terminal (for frame rate limiting)
+    last_image_sent: Instant,
+    /// Minimum interval between image outputs (caps terminal I/O)
+    image_interval: Duration,
+    /// Last time camera/view was changed (for adaptive resolution)
+    last_interaction: Instant,
 }
 
 /// Sanitize a string for safe display in terminal
@@ -149,7 +323,7 @@ impl App {
             show_help: false,
             show_ligands: false,
             show_waters: false,
-            shading_enabled: false,
+            shading_enabled: true,
             auto_spin: false,
             alt_loc_mode: AltLocMode::A,
             default_assembly: Assembly::single_identity(),
@@ -162,6 +336,16 @@ impl App {
             backend,
             backend_changed: false,
             should_quit: false,
+            last_image_sent: Instant::now(),
+            // Protocol-specific image intervals to avoid overwhelming terminal
+            // iTerm2/Sixel have higher latency than Kitty due to PNG/palette encoding
+            image_interval: match backend {
+                RenderBackend::Image(output::ImageProtocol::Kitty) => Duration::from_millis(33),  // ~30 FPS
+                RenderBackend::Image(output::ImageProtocol::ITerm2) => Duration::from_millis(50), // ~20 FPS (lower res)
+                RenderBackend::Image(output::ImageProtocol::Sixel) => Duration::from_millis(66),  // ~15 FPS
+                RenderBackend::HalfBlock => Duration::from_millis(16), // ~60 FPS (no image protocol)
+            },
+            last_interaction: Instant::now(),
         };
 
         app.fit_camera_to_current_assembly();
@@ -169,6 +353,11 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Track keyboard interaction for adaptive resolution
+        // (skip for quit/help which don't affect molecule view)
+        if !matches!(code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('H')) {
+            self.last_interaction = Instant::now();
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -268,6 +457,7 @@ impl App {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_drag = Some((event.column, event.row));
+                self.last_interaction = Instant::now();
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some((prev_x, prev_y)) = self.mouse_drag {
@@ -286,6 +476,7 @@ impl App {
                     let curr = prev + delta;
                     self.camera.trackball_rotate(prev, curr);
                     self.mouse_drag = Some((event.column, event.row));
+                    self.last_interaction = Instant::now();
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -293,9 +484,11 @@ impl App {
             }
             MouseEventKind::ScrollUp => {
                 self.camera.zoom_by(1.1);
+                self.last_interaction = Instant::now();
             }
             MouseEventKind::ScrollDown => {
                 self.camera.zoom_by(0.9);
+                self.last_interaction = Instant::now();
             }
             _ => {}
         }
@@ -368,12 +561,12 @@ impl App {
 
         // Collect visible atoms with their screen positions per assembly instance
         // Now includes size_scale for perspective-correct sizing
-        let mut projected_instances: Vec<Vec<(usize, f32, f32, f32, f32, (u8, u8, u8))>> = Vec::new();
+        let mut projected_instances: Vec<Vec<(usize, ProjInfo)>> = Vec::new();
         let mut z_min = f32::INFINITY;
         let mut z_max = f32::NEG_INFINITY;
 
         for instance in &self.current_assembly().instances {
-            let mut projected: Vec<(usize, f32, f32, f32, f32, (u8, u8, u8))> = Vec::new();
+            let mut projected: Vec<(usize, ProjInfo)> = Vec::with_capacity(self.molecule.atoms.len());
             for (idx, atom) in self.molecule.atoms.iter().enumerate() {
                 if !self.is_atom_visible(atom) {
                     continue;
@@ -393,11 +586,8 @@ impl App {
                 // Determine color based on scheme
                 let color = self.get_atom_color(atom, idx);
 
-                projected.push((idx, sx, sy, z, size_scale, color));
+                projected.push((idx, ProjInfo { x: sx, y: sy, z, size_scale, color }));
             }
-
-            // Sort by depth (back to front)
-            projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
             projected_instances.push(projected);
         }
 
@@ -446,7 +636,7 @@ impl App {
     fn render_backbone(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, ProjInfo)],
         _scale: f32,
         z_min: f32,
         z_max: f32,
@@ -464,31 +654,31 @@ impl App {
             .collect();
 
         // Create a map from atom index to projected position (includes size_scale)
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
-            .iter()
-            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
-            .collect();
+        let mut proj_map = vec![None; self.molecule.atoms.len()];
+        for (idx, info) in projected {
+            proj_map[*idx] = Some(*info);
+        }
 
         // Draw lines between consecutive backbone atoms in same chain
         let mut prev: Option<(char, i32, f32, f32, f32, (u8, u8, u8))> = None;
 
         for &idx in &backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
+            if let Some(info) = proj_map[idx] {
                 let color = if self.shading_enabled {
-                    depth_cue(*color, *z, z_max, z_min)
+                    depth_cue(info.color, info.z, z_max, z_min)
                 } else {
-                    *color
+                    info.color
                 };
 
                 if let Some((prev_chain, prev_seq, px, py, pz, _pcolor)) = prev {
                     // Only connect if same chain and consecutive residue
                     if atom.chain_id == prev_chain && atom.residue_seq == prev_seq + 1 {
-                        buffer.draw_line(px, py, pz, *x, *y, *z, color);
+                        buffer.draw_line(px, py, pz, info.x, info.y, info.z, color);
                     }
                 }
 
-                prev = Some((atom.chain_id, atom.residue_seq, *x, *y, *z, color));
+                prev = Some((atom.chain_id, atom.residue_seq, info.x, info.y, info.z, color));
             }
         }
     }
@@ -496,166 +686,112 @@ impl App {
     fn render_ball_and_stick(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, ProjInfo)],
         scale: f32,
         z_min: f32,
         z_max: f32,
     ) {
         use crate::render::braille::depth_cue;
 
-        let width = buffer.width();
-        let height = buffer.height();
-
-        // Create a map from atom index to projected position
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
-            .iter()
-            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
-            .collect();
-
-        // Collect all primitives for parallel rendering
-        enum Primitive {
-            Sphere { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8) },
-            Cylinder { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8) },
-            Line { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8) },
-            Circle { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8) },
+        let mut proj_map = vec![None; self.molecule.atoms.len()];
+        for (idx, info) in projected {
+            proj_map[*idx] = Some(*info);
         }
 
         let mut primitives: Vec<Primitive> = Vec::with_capacity(self.molecule.bonds.len() + projected.len());
 
+        // Adaptive quality: use lines for bonds when molecule is large (>500 bonds)
+        // Cylinders are expensive (~100 pixels each for per-pixel raycast)
+        let use_cylinder_bonds = self.shading_enabled && self.molecule.bonds.len() < 500;
+
         // Collect bond primitives
         for bond in &self.molecule.bonds {
-            if let (Some(&(x1, y1, z1, ss1, c1)), Some(&(x2, y2, z2, ss2, _c2))) =
-                (proj_map.get(&bond.atom1), proj_map.get(&bond.atom2))
-            {
-                let avg_z = (z1 + z2) / 2.0;
-                let avg_size_scale = (ss1 + ss2) / 2.0;
+            if let (Some(p1), Some(p2)) = (proj_map[bond.atom1], proj_map[bond.atom2]) {
+                let avg_z = (p1.z + p2.z) / 2.0;
+                let avg_size_scale = (p1.size_scale + p2.size_scale) / 2.0;
                 let bond_radius = scale * 0.08 * avg_size_scale / self.camera.zoom;
                 let color = if self.shading_enabled {
-                    depth_cue(c1, avg_z, z_max, z_min)
+                    depth_cue(p1.color, avg_z, z_max, z_min)
                 } else {
-                    c1
+                    p1.color
                 };
-                if self.shading_enabled && bond_radius > 1.0 {
-                    primitives.push(Primitive::Cylinder { x0: x1, y0: y1, z0: z1, x1: x2, y1: y2, z1: z2, radius: bond_radius.min(4.0), color });
+                if use_cylinder_bonds && bond_radius > 1.0 {
+                    primitives.push(Primitive::cylinder(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, bond_radius.min(4.0), color));
                 } else {
-                    primitives.push(Primitive::Line { x0: x1, y0: y1, z0: z1, x1: x2, y1: y2, z1: z2, color });
+                    primitives.push(Primitive::line(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, color));
                 }
             }
         }
+
+        // Adaptive quality: use circles for atoms when molecule is very large (>1000 atoms)
+        let use_shaded_spheres = self.shading_enabled && projected.len() < 1000;
 
         // Collect atom primitives
-        for (idx, x, y, z, size_scale, color) in projected {
+        for (idx, info) in projected {
             let atom = &self.molecule.atoms[*idx];
-            let radius = atom.vdw_radius() * scale * 0.15 * size_scale / self.camera.zoom;
+            let radius = atom.vdw_radius() * scale * 0.15 * info.size_scale / self.camera.zoom;
             let color = if self.shading_enabled {
-                depth_cue(*color, *z, z_max, z_min)
+                depth_cue(info.color, info.z, z_max, z_min)
             } else {
-                *color
+                info.color
             };
-            if self.shading_enabled {
-                primitives.push(Primitive::Sphere { x: *x, y: *y, z: *z, radius: radius.max(1.0), color });
+            if use_shaded_spheres {
+                // Cap sphere radius to limit per-pixel work
+                primitives.push(Primitive::sphere(info.x, info.y, info.z, radius.clamp(1.0, 20.0), color));
             } else {
-                primitives.push(Primitive::Circle { x: *x, y: *y, z: *z, radius: radius.max(1.0), color });
+                primitives.push(Primitive::circle(info.x, info.y, info.z, radius.max(1.0), color));
             }
         }
 
-        // Render primitives in parallel using thread-local buffers
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (primitives.len() + num_threads - 1) / num_threads;
-
-        if primitives.len() < 100 || !self.shading_enabled {
+        if primitives.len() < TILE_THRESHOLD || !self.shading_enabled {
             // Small number of primitives or no shading - render directly
             for prim in &primitives {
-                match prim {
-                    Primitive::Sphere { x, y, z, radius, color } => buffer.draw_sphere_shaded(*x, *y, *z, *radius, *color),
-                    Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color } => buffer.draw_cylinder_shaded(*x0, *y0, *z0, *x1, *y1, *z1, *radius, *color),
-                    Primitive::Line { x0, y0, z0, x1, y1, z1, color } => buffer.draw_line(*x0, *y0, *z0, *x1, *y1, *z1, *color),
-                    Primitive::Circle { x, y, z, radius, color } => buffer.draw_circle(*x, *y, *z, *radius, *color),
-                }
+                prim.draw_offset(buffer, 0, 0);
             }
         } else {
-            // Parallel rendering for large primitive counts
-            let local_buffers: Vec<PixelBuffer> = primitives
-                .par_chunks(chunk_size.max(1))
-                .map(|chunk| {
-                    let mut local = PixelBuffer::new(width, height);
-                    for prim in chunk {
-                        match prim {
-                            Primitive::Sphere { x, y, z, radius, color } => local.draw_sphere_shaded(*x, *y, *z, *radius, *color),
-                            Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color } => local.draw_cylinder_shaded(*x0, *y0, *z0, *x1, *y1, *z1, *radius, *color),
-                            Primitive::Line { x0, y0, z0, x1, y1, z1, color } => local.draw_line(*x0, *y0, *z0, *x1, *y1, *z1, *color),
-                            Primitive::Circle { x, y, z, radius, color } => local.draw_circle(*x, *y, *z, *radius, *color),
-                        }
-                    }
-                    local
-                })
-                .collect();
-
-            // Merge all thread-local buffers
-            for local in &local_buffers {
-                buffer.merge_from(local);
-            }
+            render_primitives_tiled(buffer, &primitives);
         }
     }
 
     fn render_surface(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, ProjInfo)],
         scale: f32,
         z_min: f32,
         z_max: f32,
     ) {
         use crate::render::braille::depth_cue;
 
-        let width = buffer.width();
-        let height = buffer.height();
         let probe_radius = 1.4_f32;
         let surface_scale = 0.15_f32;
 
-        // Pre-compute sphere parameters
-        let spheres: Vec<(f32, f32, f32, f32, (u8, u8, u8))> = projected
-            .iter()
-            .map(|(idx, x, y, z, size_scale, color)| {
-                let atom = &self.molecule.atoms[*idx];
-                let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale * size_scale / self.camera.zoom;
-                let color = if self.shading_enabled {
-                    depth_cue(*color, *z, z_max, z_min)
-                } else {
-                    *color
-                };
-                (*x, *y, *z, radius.max(1.0), color)
-            })
-            .collect();
+        // Adaptive quality: use circles for very large molecules (>1000 atoms)
+        let use_shaded_spheres = self.shading_enabled && projected.len() < 1000;
 
-        if spheres.len() < 100 || !self.shading_enabled {
-            // Small count - render directly
-            for (x, y, z, radius, color) in &spheres {
-                if self.shading_enabled {
-                    buffer.draw_sphere_shaded(*x, *y, *z, *radius, *color);
-                } else {
-                    buffer.draw_circle(*x, *y, *z, *radius, *color);
-                }
+        let mut primitives: Vec<Primitive> = Vec::with_capacity(projected.len());
+        for (idx, info) in projected {
+            let atom = &self.molecule.atoms[*idx];
+            let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale * info.size_scale / self.camera.zoom;
+            let color = if self.shading_enabled {
+                depth_cue(info.color, info.z, z_max, z_min)
+            } else {
+                info.color
+            };
+            if use_shaded_spheres {
+                // Cap sphere radius to limit per-pixel work
+                primitives.push(Primitive::sphere(info.x, info.y, info.z, radius.clamp(1.0, 25.0), color));
+            } else {
+                primitives.push(Primitive::circle(info.x, info.y, info.z, radius.max(1.0), color));
+            }
+        }
+
+        if primitives.len() < TILE_THRESHOLD || !self.shading_enabled {
+            for prim in &primitives {
+                prim.draw_offset(buffer, 0, 0);
             }
         } else {
-            // Parallel rendering
-            let num_threads = rayon::current_num_threads().max(1);
-            let chunk_size = (spheres.len() + num_threads - 1) / num_threads;
-
-            let local_buffers: Vec<PixelBuffer> = spheres
-                .par_chunks(chunk_size.max(1))
-                .map(|chunk| {
-                    let mut local = PixelBuffer::new(width, height);
-                    for (x, y, z, radius, color) in chunk {
-                        local.draw_sphere_shaded(*x, *y, *z, *radius, *color);
-                    }
-                    local
-                })
-                .collect();
-
-            for local in &local_buffers {
-                buffer.merge_from(local);
-            }
+            render_primitives_tiled(buffer, &primitives);
         }
     }
 
@@ -663,7 +799,7 @@ impl App {
     fn render_cartoon(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, ProjInfo)],
         _scale: f32,
         z_min: f32,
         z_max: f32,
@@ -679,10 +815,10 @@ impl App {
             .collect();
 
         // Create a map from atom index to projected position (includes size_scale)
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
-            .iter()
-            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
-            .collect();
+        let mut proj_map = vec![None; self.molecule.atoms.len()];
+        for (idx, info) in projected {
+            proj_map[*idx] = Some(*info);
+        }
 
         // Size scale for ribbon widths - based on screen size, not position scale
         // Target: helix ~3-5% of screen height, sheet ~2-4%, coil ~1-2%
@@ -718,7 +854,7 @@ impl App {
         &self,
         buffer: &mut PixelBuffer,
         backbone_indices: &[usize],
-        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))>,
+        proj_map: &[Option<ProjInfo>],
         helix_width: f32,
         sheet_width: f32,
         coil_width: f32,
@@ -734,13 +870,13 @@ impl App {
 
         for &idx in backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
+            if let Some(info) = proj_map[idx] {
                 let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
-                let color = depth_cue(*color, *z, z_max, z_min);
+                let color = depth_cue(info.color, info.z, z_max, z_min);
 
                 if let Some((prev_chain, prev_seq, px, py, pz, prev_color, prev_ss)) = prev {
                     if atom.chain_id == prev_chain && atom.residue_seq == prev_seq + 1 {
-                        let segment_dir = Vector2::new(*x - px, *y - py);
+                        let segment_dir = Vector2::new(info.x - px, info.y - py);
                         last_segment_dir = Some(segment_dir);
 
                         let width = match (&prev_ss, &ss) {
@@ -748,7 +884,7 @@ impl App {
                             (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => sheet_width,
                             _ => coil_width,
                         };
-                        self.draw_ribbon(buffer, px, py, pz, *x, *y, *z, color, width);
+                        self.draw_ribbon(buffer, px, py, pz, info.x, info.y, info.z, color, width);
 
                         if matches!(prev_ss, SecondaryStructure::Sheet) && !matches!(ss, SecondaryStructure::Sheet) {
                             self.draw_arrowhead(buffer, px, py, pz, segment_dir, prev_color, arrow_length, arrow_width);
@@ -757,7 +893,7 @@ impl App {
                         last_segment_dir = None;
                     }
                 }
-                prev = Some((atom.chain_id, atom.residue_seq, *x, *y, *z, color, ss));
+                prev = Some((atom.chain_id, atom.residue_seq, info.x, info.y, info.z, color, ss));
             }
         }
 
@@ -773,7 +909,7 @@ impl App {
         &self,
         buffer: &mut PixelBuffer,
         backbone_indices: &[usize],
-        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))>,
+        proj_map: &[Option<ProjInfo>],
         helix_width: f32,
         sheet_width: f32,
         coil_width: f32,
@@ -789,10 +925,10 @@ impl App {
 
         for &idx in backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
+            if let Some(info) = proj_map[idx] {
                 let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
-                let color = depth_cue(*color, *z, z_max, z_min);
-                segments.push((*x, *y, *z, color, ss, atom.chain_id, atom.residue_seq));
+                let color = depth_cue(info.color, info.z, z_max, z_min);
+                segments.push((info.x, info.y, info.z, color, ss, atom.chain_id, atom.residue_seq));
             }
         }
 
@@ -1108,6 +1244,13 @@ impl App {
             RenderBackend::Image(ImageProtocol::ITerm2) => RenderBackend::Image(ImageProtocol::Sixel),
             RenderBackend::Image(ImageProtocol::Sixel) => RenderBackend::HalfBlock,
         };
+        // Update image interval for new protocol
+        self.image_interval = match self.backend {
+            RenderBackend::Image(ImageProtocol::Kitty) => Duration::from_millis(33),  // ~30 FPS
+            RenderBackend::Image(ImageProtocol::ITerm2) => Duration::from_millis(50), // ~20 FPS
+            RenderBackend::Image(ImageProtocol::Sixel) => Duration::from_millis(66),  // ~15 FPS
+            RenderBackend::HalfBlock => Duration::from_millis(16), // ~60 FPS
+        };
         self.backend_changed = true;
     }
 
@@ -1123,7 +1266,159 @@ impl App {
     }
 }
 
-/// Run the interactive viewer
+/// Run benchmark mode: high-quality rendering with auto-rotation for 2 seconds
+/// Outputs detailed performance metrics to benchmark.log
+/// Works headless (no terminal required) for CI/automation
+pub fn run_benchmark(path: &Path, molecule: Molecule) -> Result<(), UiError> {
+    use std::fs::File;
+    use std::io::Write as IoWrite;
+
+    const BENCHMARK_DURATION: Duration = Duration::from_secs(2);
+    const LOG_FILE: &str = "benchmark.log";
+
+    // Headless benchmark - no terminal needed
+    let render_backend = RenderBackend::HalfBlock; // Use half-block for headless
+    let mut app = App::new(path, molecule, render_backend);
+
+    // Enable high quality settings for benchmark
+    app.shading_enabled = true;
+    app.auto_spin = true;
+    app.show_hud = false;
+    app.representation = crate::render::Representation::BallAndStick;
+
+    // Fixed resolution for reproducible benchmarks (simulates 160x48 terminal with 2x4 pixels/cell)
+    let mol_width: u16 = 160;
+    let mol_height: u16 = 48;
+    let pixels_per_cell = (2, 4); // High quality
+    let render_width = mol_width as usize * pixels_per_cell.0;
+    let render_height = mol_height as usize * pixels_per_cell.1;
+
+    println!("Starting benchmark...");
+    println!("  File: {}", path.display());
+    println!("  Atoms: {}, Bonds: {}", app.molecule.atoms.len(), app.molecule.bonds.len());
+    println!("  Resolution: {}x{}", render_width, render_height);
+    println!("  Shading: {}, Representation: {:?}", app.shading_enabled, app.representation);
+
+    // Collect timing data
+    let mut frame_times: Vec<f64> = Vec::new();
+    let mut render_times: Vec<f64> = Vec::new();
+    let mut post_times: Vec<f64> = Vec::new();
+    let mut clear_times: Vec<f64> = Vec::new();
+
+    let benchmark_start = Instant::now();
+    let mut buffer = PixelBuffer::new(render_width, render_height);
+    let mut total_frames = 0u64;
+
+    // Benchmark loop
+    while benchmark_start.elapsed() < BENCHMARK_DURATION {
+        let frame_start = Instant::now();
+
+        // Auto-spin (faster for benchmark to stress test)
+        let rotation_delta = Vector2::new(0.02, 0.005);
+        app.camera.trackball_rotate(Vector2::zeros(), rotation_delta);
+
+        let t0 = Instant::now();
+        buffer.resize_or_clear(render_width, render_height);
+        let t1 = Instant::now();
+
+        app.render_molecule(&mut buffer, pixels_per_cell);
+        let t2 = Instant::now();
+
+        // Apply post-processing (same as real rendering)
+        apply_edge_aa(&mut buffer, 0.55, 0.06);
+        apply_silhouette_edges(&mut buffer, 0.15, 0.5);
+        let t3 = Instant::now();
+
+        // Record timings (in milliseconds)
+        clear_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+        render_times.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
+        post_times.push(t3.duration_since(t2).as_secs_f64() * 1000.0);
+        frame_times.push(frame_start.elapsed().as_secs_f64() * 1000.0);
+
+        total_frames += 1;
+
+        // Progress indicator
+        if total_frames % 10 == 0 {
+            print!(".");
+            std::io::stdout().flush().ok();
+        }
+    }
+    println!();
+
+    let total_duration = benchmark_start.elapsed();
+
+    // Calculate statistics
+    let avg = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len().max(1) as f64 };
+    let min = |v: &[f64]| -> f64 { v.iter().cloned().fold(f64::INFINITY, f64::min) };
+    let max = |v: &[f64]| -> f64 { v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) };
+    let percentile = |v: &mut [f64], p: f64| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((p / 100.0) * (v.len() - 1) as f64) as usize;
+        v.get(idx).copied().unwrap_or(0.0)
+    };
+
+    let avg_fps = total_frames as f64 / total_duration.as_secs_f64();
+    let avg_frame = avg(&frame_times);
+    let min_frame = min(&frame_times);
+    let max_frame = max(&frame_times);
+    let mut frame_times_sorted = frame_times.clone();
+    let p95_frame = percentile(&mut frame_times_sorted, 95.0);
+    let p99_frame = percentile(&mut frame_times_sorted, 99.0);
+
+    // Write to log file
+    let mut log = File::create(LOG_FILE).map_err(|e| UiError::TerminalError(e))?;
+
+    writeln!(log, "=== PDBCAT BENCHMARK RESULTS ===").ok();
+    writeln!(log, "File: {}", path.display()).ok();
+    writeln!(log, "Backend: {} (headless)", render_backend.label()).ok();
+    writeln!(log, "Resolution: {}x{}", render_width, render_height).ok();
+    writeln!(log, "Representation: {:?}", app.representation).ok();
+    writeln!(log, "Shading: {}", app.shading_enabled).ok();
+    writeln!(log, "Atoms: {}", app.molecule.atoms.len()).ok();
+    writeln!(log, "Bonds: {}", app.molecule.bonds.len()).ok();
+    writeln!(log, "").ok();
+    writeln!(log, "=== SUMMARY ===").ok();
+    writeln!(log, "Duration: {:.2}s", total_duration.as_secs_f64()).ok();
+    writeln!(log, "Total frames: {}", total_frames).ok();
+    writeln!(log, "Average FPS: {:.1}", avg_fps).ok();
+    writeln!(log, "").ok();
+    writeln!(log, "=== FRAME TIME (ms) ===").ok();
+    writeln!(log, "  avg: {:.2}", avg_frame).ok();
+    writeln!(log, "  min: {:.2}", min_frame).ok();
+    writeln!(log, "  max: {:.2}", max_frame).ok();
+    writeln!(log, "  p95: {:.2}", p95_frame).ok();
+    writeln!(log, "  p99: {:.2}", p99_frame).ok();
+    writeln!(log, "").ok();
+    writeln!(log, "=== BREAKDOWN (ms, avg) ===").ok();
+    writeln!(log, "  clear:      {:.2}", avg(&clear_times)).ok();
+    writeln!(log, "  render:     {:.2}", avg(&render_times)).ok();
+    writeln!(log, "  post:       {:.2}", avg(&post_times)).ok();
+    writeln!(log, "").ok();
+    writeln!(log, "=== PER-FRAME DATA ===").ok();
+    writeln!(log, "frame,total_ms,clear_ms,render_ms,post_ms").ok();
+    for i in 0..total_frames as usize {
+        writeln!(log, "{},{:.3},{:.3},{:.3},{:.3}",
+            i,
+            frame_times.get(i).unwrap_or(&0.0),
+            clear_times.get(i).unwrap_or(&0.0),
+            render_times.get(i).unwrap_or(&0.0),
+            post_times.get(i).unwrap_or(&0.0),
+        ).ok();
+    }
+
+    // Print summary to stdout
+    println!("\n=== BENCHMARK RESULTS ===");
+    println!("Duration: {:.2}s, Frames: {}, Avg FPS: {:.1}",
+        total_duration.as_secs_f64(), total_frames, avg_fps);
+    println!("Frame time: avg={:.1}ms, min={:.1}ms, max={:.1}ms, p95={:.1}ms, p99={:.1}ms",
+        avg_frame, min_frame, max_frame, p95_frame, p99_frame);
+    println!("Breakdown: clear={:.2}ms, render={:.2}ms, post={:.2}ms",
+        avg(&clear_times), avg(&render_times), avg(&post_times));
+    println!("Detailed results written to: {}", LOG_FILE);
+
+    Ok(())
+}
+
 pub fn run(path: &Path, molecule: Molecule) -> Result<(), UiError> {
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -1170,10 +1465,11 @@ fn run_loop(
         app.fps = 1.0 / delta.as_secs_f32();
         app.last_frame = now;
 
-        // Auto-spin
+        // Auto-spin (slow rotation for viewing)
         if app.auto_spin {
-            let rotation_delta = Vector2::new(0.004, 0.0);
+            let rotation_delta = Vector2::new(0.0013, 0.0);
             app.camera.trackball_rotate(Vector2::zeros(), rotation_delta);
+            app.last_interaction = now; // Mark as active during spin
         }
 
         let size = terminal.size()?;
@@ -1187,38 +1483,37 @@ fn run_loop(
         }
         let mol_width = size.width.max(1);
 
+        // Adaptive resolution: high quality when idle, lower during motion
+        let idle_duration = now.duration_since(app.last_interaction);
+        let is_idle = idle_duration > Duration::from_millis(300);
+
         let image_active = matches!(app.backend, RenderBackend::Image(_)) && !app.show_help;
         let pixels_per_cell = if app.show_help {
             (1, 2)
         } else {
             match app.backend {
                 RenderBackend::HalfBlock => (1, 2),
-                // Sixel uses 6 vertical pixels per band, horizontal matches other backends
+                // Sixel uses 6 vertical pixels per band
                 RenderBackend::Image(output::ImageProtocol::Sixel) => {
-                    if app.shading_enabled { (2, 6) } else { (4, 6) }
+                    if is_idle { (3, 6) } else { (2, 6) }
                 }
-                // Resolution for Kitty/iTerm2 - (2,4) for performance, (4,8) for quality
-                // With shading disabled, can use higher res; with shading, use lower
-                RenderBackend::Image(_) => if app.shading_enabled { (2, 4) } else { (4, 8) },
+                // Kitty can handle higher res due to zlib compression
+                RenderBackend::Image(output::ImageProtocol::Kitty) => {
+                    if is_idle { (4, 8) } else { (2, 4) }
+                }
+                // iTerm2 uses PNG - higher res when idle
+                RenderBackend::Image(output::ImageProtocol::ITerm2) => {
+                    if is_idle { (3, 6) } else { (2, 4) }
+                }
             }
         };
         let pixel_width = mol_width as usize * pixels_per_cell.0;
         let pixel_height = mol_height as usize * pixels_per_cell.1;
 
-        // Use 2x supersampling when shading is enabled for anti-aliasing
-        let use_ssaa = app.shading_enabled && image_active;
-        let (render_width, render_height) = if use_ssaa {
-            (pixel_width * 2, pixel_height * 2)
-        } else {
-            (pixel_width, pixel_height)
-        };
-
-        // Scale factor for supersampling
-        let ssaa_pixels_per_cell = if use_ssaa {
-            (pixels_per_cell.0 * 2, pixels_per_cell.1 * 2)
-        } else {
-            pixels_per_cell
-        };
+        // Supersampling disabled; edge AA is used instead.
+        let render_width = pixel_width;
+        let render_height = pixel_height;
+        let render_pixels_per_cell = pixels_per_cell;
 
         // Clear screen when backend changes to remove stale images from previous protocol
         if app.backend_changed {
@@ -1230,64 +1525,77 @@ fn run_loop(
             app.backend_changed = false;
         }
 
+        // Decide upfront if we're going to send an image this frame
+        // For image backends, skip expensive rendering if we're not sending
+        let should_send_image = image_active &&
+            now.duration_since(app.last_image_sent) >= app.image_interval;
+
         // Timing instrumentation
         let t0 = Instant::now();
 
-        // Resize buffer only if dimensions changed, otherwise just clear
-        buffer.resize_or_clear(render_width, render_height);
+        // Only render if: (1) not image backend, or (2) we're sending an image this frame
+        let needs_render = !image_active || should_send_image;
+
+        if needs_render {
+            // Resize buffer only if dimensions changed, otherwise just clear
+            buffer.resize_or_clear(render_width, render_height);
+
+            app.render_molecule(&mut buffer, render_pixels_per_cell);
+
+            // Apply post-processing for professional look
+            if app.shading_enabled {
+                // SSAO for depth and contact shadows (subtle but adds depth)
+                apply_ssao(&mut buffer, 8.0, 1.0);
+
+                // Edge AA for smoother sphere/cylinder edges
+                if image_active {
+                    apply_edge_aa(&mut buffer, 0.55, 0.06);
+                }
+
+                // Silhouette edges for ChimeraX-style outlines
+                apply_silhouette_edges(&mut buffer, 0.12, 0.5);
+
+                // Tone mapping for better color reproduction and contrast
+                apply_tone_mapping(&mut buffer, 1.15);
+            }
+        }
         let t1 = Instant::now();
 
-        app.render_molecule(&mut buffer, ssaa_pixels_per_cell);
+        let final_buffer: &PixelBuffer = &buffer;
 
-        // Apply silhouette edges when shading is enabled (ChimeraX-style outlines)
-        // Note: SSAO and tone mapping disabled for performance
-        if app.shading_enabled {
-            apply_silhouette_edges(&mut buffer, 0.15, 0.5);
-        }
-        let t2 = Instant::now();
-
-        // Downsample if using supersampling, otherwise use buffer directly
-        let downsampled;
-        let final_buffer: &PixelBuffer = if use_ssaa {
-            downsampled = downsample_2x(&buffer);
-            &downsampled
-        } else {
-            &buffer
-        };
-        let t3 = Instant::now();
-
-        // Render
+        // Render TUI (always needed for HUD updates)
         terminal.draw(|f| {
             let buffer_ref = if image_active { None } else { Some(final_buffer) };
             draw_ui(f, app, app.backend, mol_height, buffer_ref);
         })?;
-        let t4 = Instant::now();
+        let t2 = Instant::now();
 
-        if image_active {
+        // Send image if it's time
+        if should_send_image {
             if let RenderBackend::Image(protocol) = app.backend {
                 render_image(protocol, final_buffer, mol_width, mol_height, terminal.backend_mut())?;
+                app.last_image_sent = now;
             }
         }
-        let t5 = Instant::now();
+        let t3 = Instant::now();
 
         // Log timing every 30 frames
         if app.frame_count % 30 == 0 {
             eprintln!(
-                "TIMING: resize={:.1}ms render={:.1}ms downsample={:.1}ms draw_ui={:.1}ms image={:.1}ms total={:.1}ms ({}x{})",
+                "TIMING: render={:.1}ms ui={:.1}ms image={:.1}ms total={:.1}ms ({}x{})",
                 t1.duration_since(t0).as_secs_f32() * 1000.0,
                 t2.duration_since(t1).as_secs_f32() * 1000.0,
                 t3.duration_since(t2).as_secs_f32() * 1000.0,
-                t4.duration_since(t3).as_secs_f32() * 1000.0,
-                t5.duration_since(t4).as_secs_f32() * 1000.0,
-                t5.duration_since(t0).as_secs_f32() * 1000.0,
+                t3.duration_since(t0).as_secs_f32() * 1000.0,
                 render_width, render_height
             );
         }
         app.frame_count += 1;
 
         // Handle events with timeout for animation
-        let timeout = if app.auto_spin {
-            Duration::from_millis(16) // ~60 FPS
+        // For image backends, always use short timeout for responsive refresh
+        let timeout = if app.auto_spin || image_active {
+            app.image_interval.min(Duration::from_millis(16)) // Match image interval or 60 FPS
         } else {
             Duration::from_millis(100)
         };

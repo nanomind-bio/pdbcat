@@ -20,6 +20,11 @@ struct Args {
     /// Path to PDB or mmCIF file to view
     #[arg(value_name = "FILE")]
     file: PathBuf,
+
+    /// Run benchmark mode: rotate for 2 seconds with high quality shading,
+    /// then output performance metrics to benchmark.log
+    #[arg(long, short = 'b')]
+    benchmark: bool,
 }
 
 fn main() -> ExitCode {
@@ -59,8 +64,14 @@ fn main() -> ExitCode {
         }
     };
 
-    // Run the interactive viewer
-    if let Err(e) = ui::run(&args.file, molecule) {
+    // Run the viewer
+    let result = if args.benchmark {
+        ui::run_benchmark(&args.file, molecule)
+    } else {
+        ui::run(&args.file, molecule)
+    };
+
+    if let Err(e) = result {
         eprintln!("Error: {}", e);
         return ExitCode::from(1);
     }

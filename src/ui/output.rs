@@ -76,37 +76,72 @@ pub fn render_image(
 }
 
 fn render_kitty_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u16) -> Vec<u8> {
-    let data = rgba_bytes(buffer);
-    let payload = base64_encode(&data);
+    // Use RGB (f=24) instead of RGBA (f=32) - 25% less data
+    let raw_data = rgb_bytes(buffer);
+
+    // Use zlib compression to reduce payload size by 3-10x (critical for terminal throughput)
+    // o=z flag tells Kitty the payload is zlib-compressed
+    let compressed = zlib_compress(&raw_data);
+    let payload = base64_encode(&compressed);
+
+    // Kitty protocol requires chunking large payloads to avoid terminal buffer issues
+    // Maximum chunk size is 4096 bytes as per spec
+    const CHUNK_SIZE: usize = 4096;
 
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b[H");
-    seq.extend_from_slice(
-        format!(
-            "\x1b_Gf=32,s={},v={},c={},r={},a=T,i=1;",
-            buffer.width(),
-            buffer.height(),
-            cell_width,
-            cell_height
-        )
-        .as_bytes(),
-    );
-    seq.extend_from_slice(payload.as_bytes());
-    seq.extend_from_slice(b"\x1b\\");
+
+    let payload_bytes = payload.as_bytes();
+    let mut offset = 0;
+    let total_len = payload_bytes.len();
+
+    while offset < total_len {
+        let chunk_end = (offset + CHUNK_SIZE).min(total_len);
+        let chunk = &payload_bytes[offset..chunk_end];
+        let is_last = chunk_end >= total_len;
+
+        if offset == 0 {
+            // First chunk includes image metadata
+            // f=24 = RGB (no alpha), o=z = zlib-compressed
+            seq.extend_from_slice(
+                format!(
+                    "\x1b_Gf=24,o=z,s={},v={},c={},r={},a=T,i=1,m={};",
+                    buffer.width(),
+                    buffer.height(),
+                    cell_width,
+                    cell_height,
+                    if is_last { 0 } else { 1 }
+                )
+                .as_bytes(),
+            );
+        } else {
+            // Continuation chunks only need m flag
+            seq.extend_from_slice(
+                format!("\x1b_Gm={};", if is_last { 0 } else { 1 }).as_bytes(),
+            );
+        }
+
+        seq.extend_from_slice(chunk);
+        seq.extend_from_slice(b"\x1b\\");
+
+        offset = chunk_end;
+    }
+
     seq
 }
 
 fn render_iterm2_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u16) -> Vec<u8> {
-    let png = encode_png(buffer);
+    // Use RGB PNG (no alpha) - 25% smaller than RGBA
+    let png = encode_png_rgb(buffer);
     let payload = base64_encode(&png);
 
-    // Use cell-based sizing with explicit "cell" units
+    // preserveAspectRatio=0 prevents scaling blur by fitting exact dimensions
     // doNotMoveCursor=1 prevents cursor jump/scroll after image
     let mut seq = Vec::new();
     seq.extend_from_slice(b"\x1b[H");
     seq.extend_from_slice(
         format!(
-            "\x1b]1337;File=inline=1;size={};width={}cell;height={}cell;doNotMoveCursor=1:",
+            "\x1b]1337;File=inline=1;size={};width={}cell;height={}cell;preserveAspectRatio=0;doNotMoveCursor=1:",
             png.len(),
             cell_width,
             cell_height
@@ -219,6 +254,18 @@ fn rgba_bytes(buffer: &PixelBuffer) -> Vec<u8> {
     data
 }
 
+/// RGB bytes (no alpha) - 25% smaller than RGBA
+fn rgb_bytes(buffer: &PixelBuffer) -> Vec<u8> {
+    let mut data = Vec::with_capacity(buffer.width() * buffer.height() * 3);
+    for y in 0..buffer.height() {
+        for x in 0..buffer.width() {
+            let (r, g, b, _) = buffer.get_pixel(x, y);
+            data.extend_from_slice(&[r, g, b]);
+        }
+    }
+    data
+}
+
 fn sixel_index(r: u8, g: u8, b: u8) -> u16 {
     let r6 = (r as u16 * 5 + 127) / 255;
     let g6 = (g as u16 * 5 + 127) / 255;
@@ -239,12 +286,17 @@ fn sixel_color(idx: u16) -> (u8, u8, u8) {
 }
 
 fn encode_png(buffer: &PixelBuffer) -> Vec<u8> {
+    encode_png_rgba(buffer)
+}
+
+/// Encode as RGBA PNG (4 bytes per pixel)
+fn encode_png_rgba(buffer: &PixelBuffer) -> Vec<u8> {
     let width = buffer.width() as u32;
     let height = buffer.height() as u32;
     let mut raw = Vec::with_capacity((buffer.width() * buffer.height() * 4) + buffer.height());
 
     for y in 0..buffer.height() {
-        raw.push(0);
+        raw.push(0); // filter byte
         for x in 0..buffer.width() {
             let (r, g, b, a) = buffer.get_pixel(x, y);
             raw.extend_from_slice(&[r, g, b, a]);
@@ -260,6 +312,39 @@ fn encode_png(buffer: &PixelBuffer) -> Vec<u8> {
     ihdr.extend_from_slice(&height.to_be_bytes());
     ihdr.push(8); // bit depth
     ihdr.push(6); // color type RGBA
+    ihdr.push(0); // compression
+    ihdr.push(0); // filter
+    ihdr.push(0); // interlace
+    write_chunk(&mut png, b"IHDR", &ihdr);
+    write_chunk(&mut png, b"IDAT", &compressed);
+    write_chunk(&mut png, b"IEND", &[]);
+
+    png
+}
+
+/// Encode as RGB PNG (3 bytes per pixel) - 25% smaller than RGBA
+fn encode_png_rgb(buffer: &PixelBuffer) -> Vec<u8> {
+    let width = buffer.width() as u32;
+    let height = buffer.height() as u32;
+    let mut raw = Vec::with_capacity((buffer.width() * buffer.height() * 3) + buffer.height());
+
+    for y in 0..buffer.height() {
+        raw.push(0); // filter byte
+        for x in 0..buffer.width() {
+            let (r, g, b, _) = buffer.get_pixel(x, y);
+            raw.extend_from_slice(&[r, g, b]);
+        }
+    }
+
+    let compressed = zlib_compress(&raw);
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.push(8); // bit depth
+    ihdr.push(2); // color type RGB (no alpha)
     ihdr.push(0); // compression
     ihdr.push(0); // filter
     ihdr.push(0); // interlace
