@@ -92,7 +92,8 @@ impl Camera {
     /// Zoom in or out
     pub fn zoom_by(&mut self, factor: f32) {
         self.zoom *= factor;
-        self.zoom = self.zoom.clamp(0.1, 100.0);
+        // Allow small zoom values for large molecules (max_dim ~100Å gives zoom ~0.02)
+        self.zoom = self.zoom.clamp(0.001, 100.0);
     }
 
     /// Transform a 3D point to screen coordinates
