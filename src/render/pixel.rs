@@ -4,29 +4,126 @@
 
 use rayon::prelude::*;
 
-/// Convert sRGB color component (0-255) to linear color space (0.0-1.0)
-/// Uses the exact sRGB transfer function
-#[inline]
-fn srgb_to_linear(c: u8) -> f32 {
-    let c = c as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
+/// Precomputed sRGB to linear lookup table (256 entries)
+/// Eliminates expensive pow() calls in hot paths
+const SRGB_TO_LINEAR_LUT: [f32; 256] = {
+    let mut lut = [0.0_f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let c = i as f32 / 255.0;
+        lut[i] = if c <= 0.04045 {
+            c / 12.92
+        } else {
+            // Manual pow approximation for const context
+            // (c + 0.055) / 1.055 raised to 2.4
+            let base = (c + 0.055) / 1.055;
+            // Use exp(2.4 * ln(base)) approximation via iteration
+            let ln_base = const_ln(base);
+            const_exp(2.4 * ln_base)
+        };
+        i += 1;
     }
+    lut
+};
+
+/// Const-compatible natural log approximation
+const fn const_ln(x: f32) -> f32 {
+    // ln(x) using series expansion around 1
+    // For x in [0.5, 1], use ln(x) = -ln(1/x)
+    // We work with x in range ~0.05 to 1.0
+    if x <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+
+    // Reduce to range [0.5, 1] by extracting powers of 2
+    let mut mantissa = x;
+    let mut exp = 0_i32;
+    while mantissa < 0.5 {
+        mantissa *= 2.0;
+        exp -= 1;
+    }
+    while mantissa > 1.0 {
+        mantissa *= 0.5;
+        exp += 1;
+    }
+
+    // ln(mantissa) where mantissa in [0.5, 1]
+    // Use ln(1+u) series where u = mantissa - 1
+    let u = mantissa - 1.0;
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let u4 = u3 * u;
+    let u5 = u4 * u;
+    let ln_m = u - u2/2.0 + u3/3.0 - u4/4.0 + u5/5.0;
+
+    // ln(x) = ln(mantissa * 2^exp) = ln(mantissa) + exp * ln(2)
+    ln_m + (exp as f32) * 0.693147180559945
 }
 
+/// Const-compatible exp approximation
+const fn const_exp(x: f32) -> f32 {
+    // exp(x) using Taylor series
+    // Reduce range: exp(x) = exp(x - n*ln2) * 2^n
+    let ln2 = 0.693147180559945_f32;
+    let n = (x / ln2) as i32;
+    let r = x - (n as f32) * ln2;
+
+    // Taylor series for exp(r) where |r| < ln(2)
+    let r2 = r * r;
+    let r3 = r2 * r;
+    let r4 = r3 * r;
+    let r5 = r4 * r;
+    let exp_r = 1.0 + r + r2/2.0 + r3/6.0 + r4/24.0 + r5/120.0;
+
+    // Multiply by 2^n
+    let mut result = exp_r;
+    let mut i = 0;
+    if n > 0 {
+        while i < n {
+            result *= 2.0;
+            i += 1;
+        }
+    } else {
+        while i > n {
+            result *= 0.5;
+            i -= 1;
+        }
+    }
+    result
+}
+
+/// Convert sRGB color component (0-255) to linear color space (0.0-1.0)
+/// Uses precomputed lookup table for speed
+#[inline]
+fn srgb_to_linear(c: u8) -> f32 {
+    SRGB_TO_LINEAR_LUT[c as usize]
+}
+
+/// Precomputed linear to sRGB lookup table (1024 entries for [0,1] range)
+/// 10-bit precision is sufficient for 8-bit output
+const LINEAR_TO_SRGB_LUT: [u8; 1024] = {
+    let mut lut = [0_u8; 1024];
+    let mut i = 0;
+    while i < 1024 {
+        let c = i as f32 / 1023.0;
+        let v = if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            let ln_c = const_ln(c);
+            1.055 * const_exp(ln_c / 2.4) - 0.055
+        };
+        lut[i] = if v <= 0.0 { 0 } else if v >= 1.0 { 255 } else { (v * 255.0 + 0.5) as u8 };
+        i += 1;
+    }
+    lut
+};
+
 /// Convert linear color component (0.0-1.0) to sRGB (0-255)
-/// Uses the exact sRGB transfer function
+/// Uses precomputed lookup table for speed
 #[inline]
 fn linear_to_srgb(c: f32) -> u8 {
-    let c = c.clamp(0.0, 1.0);
-    let v = if c <= 0.0031308 {
-        12.92 * c
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    };
-    (v * 255.0 + 0.5) as u8
+    let idx = (c.clamp(0.0, 1.0) * 1023.0) as usize;
+    LINEAR_TO_SRGB_LUT[idx]
 }
 
 /// A pixel buffer with depth testing.
@@ -160,8 +257,7 @@ impl PixelBuffer {
         }
     }
 
-    /// Draw a shaded sphere using Blinn-Phong lighting model with gamma-correct shading.
-    /// Creates a 3D appearance with diffuse and specular highlights.
+    /// Draw a shaded sphere - optimized version with fast pow approximations
     pub fn draw_sphere_shaded(
         &mut self,
         cx: f32,
@@ -175,95 +271,68 @@ impl PixelBuffer {
             return;
         }
 
-        // Convert base color to linear space for correct lighting math
-        let base_linear = (
-            srgb_to_linear(base_color.0),
-            srgb_to_linear(base_color.1),
-            srgb_to_linear(base_color.2),
-        );
+        // Pre-convert base color to linear (0-1)
+        let br = base_color.0 as f32 / 255.0;
+        let bg = base_color.1 as f32 / 255.0;
+        let bb = base_color.2 as f32 / 255.0;
 
-        // Key light direction (normalized) - from upper-left-front
-        let light_len = (0.4_f32 * 0.4 + 0.5 * 0.5 + 0.76 * 0.76).sqrt();
-        let light = (0.4_f32 / light_len, -0.5_f32 / light_len, 0.76_f32 / light_len);
-        // Fill light from opposite side (softer, dimmer)
-        let fill_light = (-0.3_f32, 0.2_f32, 0.5_f32);
-        let fill_strength = 0.25_f32;
-        // View direction (towards viewer)
-        let view = (0.0_f32, 0.0_f32, 1.0_f32);
-        // Halfway vector for Blinn-Phong (key light)
-        let h_len = ((light.0 + view.0).powi(2) + (light.1 + view.1).powi(2) + (light.2 + view.2).powi(2)).sqrt();
-        let half = (
-            (light.0 + view.0) / h_len,
-            (light.1 + view.1) / h_len,
-            (light.2 + view.2) / h_len,
-        );
+        // Pre-computed light direction (normalized): upper-left-front
+        const LIGHT: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        const HALF: (f32, f32, f32) = (0.230, -0.288, 1.0); // Unnormalized, will use dot directly
 
         let r2 = radius * radius;
+        let inv_r = 1.0 / radius;
         let min_x = (cx - radius).floor() as i32;
         let max_x = (cx + radius).ceil() as i32;
         let min_y = (cy - radius).floor() as i32;
         let max_y = (cy + radius).ceil() as i32;
 
-        // Lighting parameters
-        let ambient = 0.12_f32;
-        let diffuse_strength = 0.70_f32;
-        let specular_strength = 0.40_f32;
-        let shininess = 40.0_f32;
-        let rim_strength = 0.25_f32;
-        let rim_power = 2.5_f32;
-
         for y in min_y..=max_y {
+            let dy = (y as f32 + 0.5) - cy;
+            let dy2 = dy * dy;
+
             for x in min_x..=max_x {
                 let dx = (x as f32 + 0.5) - cx;
-                let dy = (y as f32 + 0.5) - cy;
-                let d2 = dx * dx + dy * dy;
+                let d2 = dx * dx + dy2;
 
                 if d2 > r2 {
                     continue;
                 }
 
-                // Calculate z on sphere surface
                 let dz = (r2 - d2).sqrt();
                 let z = cz + dz;
 
-                // Normal at this point (normalized)
-                let inv_r = 1.0 / radius;
+                // Normal (already unit length since on sphere)
                 let nx = dx * inv_r;
                 let ny = dy * inv_r;
                 let nz = dz * inv_r;
 
-                // Key light diffuse (Lambert)
-                let n_dot_l = (nx * light.0 + ny * light.1 + nz * light.2).max(0.0);
-                let diffuse = diffuse_strength * n_dot_l;
+                // Diffuse (Lambert)
+                let n_dot_l = (nx * LIGHT.0 + ny * LIGHT.1 + nz * LIGHT.2).max(0.0);
 
-                // Fill light diffuse (softer shadows)
-                let n_dot_fill = (nx * fill_light.0 + ny * fill_light.1 + nz * fill_light.2).max(0.0);
-                let fill_diffuse = fill_strength * n_dot_fill;
+                // Fast specular: (n·h)^32 ≈ x^4^4^2 using repeated squaring
+                let n_dot_h = (nx * HALF.0 + ny * HALF.1 + nz * HALF.2).max(0.0);
+                let spec2 = n_dot_h * n_dot_h;
+                let spec4 = spec2 * spec2;
+                let spec8 = spec4 * spec4;
+                let spec16 = spec8 * spec8;
+                let spec32 = spec16 * spec16;
+                let specular = if n_dot_l > 0.0 { 0.35 * spec32 } else { 0.0 };
 
-                // Specular component (Blinn-Phong) - GATED by n_dot_l
-                let n_dot_h = (nx * half.0 + ny * half.1 + nz * half.2).max(0.0);
-                let specular = if n_dot_l > 0.0 {
-                    specular_strength * n_dot_h.powf(shininess)
-                } else {
-                    0.0
-                };
+                // Simple rim: (1-nz)^2
+                let rim_t = 1.0 - nz;
+                let rim = 0.15 * rim_t * rim_t;
 
-                // Rim lighting (Fresnel-like effect at edges where nz approaches 0)
-                let rim = rim_strength * (1.0 - nz).powf(rim_power);
+                // Combine: ambient + diffuse + specular + rim
+                let shade = 0.15 + 0.70 * n_dot_l;
+                let r = (br * shade + specular + rim * br).min(1.0);
+                let g = (bg * shade + specular + rim * bg).min(1.0);
+                let b = (bb * shade + specular + rim * bb).min(1.0);
 
-                // Combine lighting in linear space
-                let shade = ambient + diffuse + fill_diffuse;
-                let lit = (
-                    base_linear.0 * shade + specular + rim * base_linear.0,
-                    base_linear.1 * shade + specular + rim * base_linear.1,
-                    base_linear.2 * shade + specular + rim * base_linear.2,
-                );
-
-                // Convert back to sRGB
                 let color = (
-                    linear_to_srgb(lit.0),
-                    linear_to_srgb(lit.1),
-                    linear_to_srgb(lit.2),
+                    (r * 255.0) as u8,
+                    (g * 255.0) as u8,
+                    (b * 255.0) as u8,
                 );
 
                 self.set_pixel(x, y, z, color);
@@ -271,8 +340,7 @@ impl PixelBuffer {
         }
     }
 
-    /// Draw a shaded cylinder (bond) between two points with gamma-correct shading.
-    /// Uses filled disk rendering for solid appearance without gaps.
+    /// Draw a shaded cylinder - fast version using bounding box raycast
     pub fn draw_cylinder_shaded(
         &mut self,
         x0: f32,
@@ -287,150 +355,97 @@ impl PixelBuffer {
         let dx = x1 - x0;
         let dy = y1 - y0;
         let dz = z1 - z0;
-        let length = (dx * dx + dy * dy + dz * dz).sqrt();
+        let length_sq = dx * dx + dy * dy + dz * dz;
 
-        if length < 0.1 {
+        if length_sq < 0.01 {
             return;
         }
 
-        // Convert base color to linear space
-        let base_linear = (
-            srgb_to_linear(color.0),
-            srgb_to_linear(color.1),
-            srgb_to_linear(color.2),
-        );
+        let length = length_sq.sqrt();
+        let inv_len = 1.0 / length;
 
-        // Key light direction (normalized) - same as spheres for consistency
-        let light_len = (0.4_f32 * 0.4 + 0.5 * 0.5 + 0.76 * 0.76).sqrt();
-        let light = (0.4_f32 / light_len, -0.5_f32 / light_len, 0.76_f32 / light_len);
-        // Fill light from opposite side
-        let fill_light = (-0.3_f32, 0.2_f32, 0.5_f32);
-        let fill_strength = 0.25_f32;
-        // View direction
-        let view = (0.0_f32, 0.0_f32, 1.0_f32);
-        // Halfway vector for specular
-        let h_len = ((light.0 + view.0).powi(2) + (light.1 + view.1).powi(2) + (light.2 + view.2).powi(2)).sqrt();
-        let half = (
-            (light.0 + view.0) / h_len,
-            (light.1 + view.1) / h_len,
-            (light.2 + view.2) / h_len,
-        );
+        // Cylinder axis direction
+        let ax = dx * inv_len;
+        let ay = dy * inv_len;
+        let az = dz * inv_len;
 
-        // Lighting parameters
-        let ambient = 0.12_f32;
-        let diffuse_strength = 0.70_f32;
-        let specular_strength = 0.30_f32;
-        let shininess = 32.0_f32;
-        let rim_strength = 0.15_f32;
-        let rim_power = 2.0_f32;
+        // Pre-convert color
+        let br = color.0 as f32 / 255.0;
+        let bg = color.1 as f32 / 255.0;
+        let bb = color.2 as f32 / 255.0;
 
-        // Perpendicular vectors to the cylinder axis
-        let axis = (dx / length, dy / length, dz / length);
-        // Find a perpendicular vector
-        let perp1 = if axis.0.abs() < 0.9 {
-            let len = (axis.1 * axis.1 + axis.2 * axis.2).sqrt();
-            if len > 0.001 {
-                (0.0, -axis.2 / len, axis.1 / len)
-            } else {
-                (0.0, 1.0, 0.0)
-            }
-        } else {
-            let len = (axis.0 * axis.0 + axis.2 * axis.2).sqrt();
-            if len > 0.001 {
-                (-axis.2 / len, 0.0, axis.0 / len)
-            } else {
-                (1.0, 0.0, 0.0)
-            }
-        };
-        // Second perpendicular (cross product)
-        let perp2 = (
-            axis.1 * perp1.2 - axis.2 * perp1.1,
-            axis.2 * perp1.0 - axis.0 * perp1.2,
-            axis.0 * perp1.1 - axis.1 * perp1.0,
-        );
+        // Light direction (pre-normalized)
+        const LIGHT: (f32, f32, f32) = (0.408, -0.511, 0.776);
 
-        // Draw cylinder as series of filled disks
-        let steps = (length * 1.5).max(2.0) as i32;
+        // 2D bounding box in screen space
+        let min_x = (x0.min(x1) - radius).floor() as i32;
+        let max_x = (x0.max(x1) + radius).ceil() as i32;
+        let min_y = (y0.min(y1) - radius).floor() as i32;
+        let max_y = (y0.max(y1) + radius).ceil() as i32;
+
         let r2 = radius * radius;
-        let r_int = radius.ceil() as i32;
 
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let cx = x0 + dx * t;
-            let cy = y0 + dy * t;
-            let cz = z0 + dz * t;
+        for y in min_y..=max_y {
+            let py = y as f32 + 0.5;
 
-            // Fill the disk at this position
-            for local_y in -r_int..=r_int {
-                for local_x in -r_int..=r_int {
-                    let dist_sq = (local_x * local_x + local_y * local_y) as f32;
-                    if dist_sq > r2 {
-                        continue;
-                    }
+            for x in min_x..=max_x {
+                let px = x as f32 + 0.5;
 
-                    // Convert local disk coordinates to world offset
-                    let lx = local_x as f32;
-                    let ly = local_y as f32;
+                // Vector from p0 to pixel
+                let vx = px - x0;
+                let vy = py - y0;
 
-                    // Offset in world space using perpendicular vectors
-                    let wx = perp1.0 * lx + perp2.0 * ly;
-                    let wy = perp1.1 * lx + perp2.1 * ly;
-                    let wz = perp1.2 * lx + perp2.2 * ly;
+                // Project onto cylinder axis: t = (v · axis)
+                let t = (vx * ax + vy * ay).clamp(0.0, length);
 
-                    let px = cx + wx;
-                    let py = cy + wy;
-                    let pz = cz + wz;
+                // Closest point on axis to pixel
+                let closest_x = x0 + ax * t;
+                let closest_y = y0 + ay * t;
+                let closest_z = z0 + az * t;
 
-                    // Normal at this point (points outward from axis)
-                    let dist = dist_sq.sqrt().max(0.001);
-                    let nx = wx / dist;
-                    let ny = wy / dist;
-                    let nz_local = wz / dist;
+                // Distance from pixel to axis (in 2D)
+                let dist_x = px - closest_x;
+                let dist_y = py - closest_y;
+                let dist_sq = dist_x * dist_x + dist_y * dist_y;
 
-                    // For depth, add z contribution from the cylinder surface
-                    let surface_z = if dist < radius {
-                        (r2 - dist_sq).sqrt() * 0.5  // Slight bulge for 3D effect
-                    } else {
-                        0.0
-                    };
-
-                    // Key light diffuse
-                    let n_dot_l = (nx * light.0 + ny * light.1 + nz_local * light.2).max(0.0);
-                    let diffuse = diffuse_strength * n_dot_l;
-
-                    // Fill light diffuse
-                    let n_dot_fill = (nx * fill_light.0 + ny * fill_light.1 + nz_local * fill_light.2).max(0.0);
-                    let fill_diffuse = fill_strength * n_dot_fill;
-
-                    // Specular (Blinn-Phong) - GATED by n_dot_l
-                    let n_dot_h = (nx * half.0 + ny * half.1 + nz_local * half.2).max(0.0);
-                    let specular = if n_dot_l > 0.0 {
-                        specular_strength * n_dot_h.powf(shininess)
-                    } else {
-                        0.0
-                    };
-
-                    // Rim lighting
-                    let n_dot_v = nz_local.abs();
-                    let rim = rim_strength * (1.0 - n_dot_v).powf(rim_power);
-
-                    // Combine lighting in linear space
-                    let shade = ambient + diffuse + fill_diffuse;
-                    let lit = (
-                        base_linear.0 * shade + specular + rim * base_linear.0,
-                        base_linear.1 * shade + specular + rim * base_linear.1,
-                        base_linear.2 * shade + specular + rim * base_linear.2,
-                    );
-
-                    // Convert back to sRGB
-                    let shaded_color = (
-                        linear_to_srgb(lit.0),
-                        linear_to_srgb(lit.1),
-                        linear_to_srgb(lit.2),
-                    );
-
-                    self.set_pixel(px as i32, py as i32, pz + surface_z, shaded_color);
+                if dist_sq > r2 {
+                    continue;
                 }
+
+                // Calculate z on cylinder surface
+                let dist = dist_sq.sqrt();
+                let surface_z = if dist < radius {
+                    closest_z + (r2 - dist_sq).sqrt() * 0.3
+                } else {
+                    closest_z
+                };
+
+                // Normal: points from axis to surface point
+                let (nx, ny, nz) = if dist > 0.001 {
+                    let inv_d = 1.0 / dist;
+                    let nz_contrib = if dist < radius { (r2 - dist_sq).sqrt() / radius } else { 0.0 };
+                    (dist_x * inv_d * (1.0 - nz_contrib), dist_y * inv_d * (1.0 - nz_contrib), nz_contrib)
+                } else {
+                    (0.0, 0.0, 1.0)
+                };
+
+                // Diffuse lighting
+                let n_dot_l = (nx * LIGHT.0 + ny * LIGHT.1 + nz * LIGHT.2).max(0.0);
+                let shade = 0.20 + 0.65 * n_dot_l;
+
+                // Simple specular
+                let spec = if n_dot_l > 0.0 && nz > 0.3 {
+                    let spec_t = nz * nz;
+                    0.2 * spec_t * spec_t
+                } else {
+                    0.0
+                };
+
+                let r = ((br * shade + spec).min(1.0) * 255.0) as u8;
+                let g = ((bg * shade + spec).min(1.0) * 255.0) as u8;
+                let b = ((bb * shade + spec).min(1.0) * 255.0) as u8;
+
+                self.set_pixel(x, y, surface_z, (r, g, b));
             }
         }
     }
@@ -698,16 +713,9 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, _threshol
         });
 }
 
-/// SSAO sample kernel - Poisson disk offsets for ambient occlusion sampling
-const SSAO_KERNEL: [(f32, f32); 12] = [
-    (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-    (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707),
-    (0.5, 0.866), (-0.5, 0.866), (0.5, -0.866), (-0.5, -0.866),
-];
-
+/// Fast SSAO - just 4 cardinal samples for performance
 /// Apply Screen Space Ambient Occlusion for enhanced depth perception.
-/// Creates soft shadows in crevices and contact areas between objects.
-/// Uses parallel processing for performance.
+/// Optimized version using only 4 samples for terminal rendering.
 pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
     let width = buffer.width;
     let height = buffer.height;
@@ -716,32 +724,18 @@ pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
         return;
     }
 
-    // Find depth range of visible pixels for normalization
-    let (min_depth, max_depth) = buffer.depth
-        .par_iter()
-        .filter(|&&d| d > f32::NEG_INFINITY)
-        .fold(
-            || (f32::INFINITY, f32::NEG_INFINITY),
-            |(min_d, max_d), &d| (min_d.min(d), max_d.max(d)),
-        )
-        .reduce(
-            || (f32::INFINITY, f32::NEG_INFINITY),
-            |(a_min, a_max), (b_min, b_max)| (a_min.min(b_min), a_max.max(b_max)),
-        );
+    // Sample radius scaled to image size
+    let r = (radius * (width.min(height) as f32 / 200.0).max(1.0)).max(2.0) as i32;
 
-    let depth_range = (max_depth - min_depth).max(1.0);
-    // Scale sample radius based on image size (larger images need larger samples)
-    let sample_radius = (radius * (width.min(height) as f32 / 200.0).max(1.0)).max(2.0);
-    // Depth threshold for occlusion (relative to depth range)
-    let depth_threshold = depth_range * 0.01;
-
-    // Compute occlusion factors in parallel
+    // Compute occlusion factors in parallel - simple 4-direction sampling
     let occlusion: Vec<f32> = (0..height)
         .into_par_iter()
         .flat_map(|y| {
             let mut row = vec![0.0_f32; width];
+            let yi = y as i32;
 
             for x in 0..width {
+                let xi = x as i32;
                 let idx = y * width + x;
 
                 // Skip background pixels
@@ -754,52 +748,28 @@ pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
                     continue;
                 }
 
-                // Sample surrounding depths using kernel
-                let mut occluded_count = 0;
-                let mut valid_samples = 0;
+                // Sample 4 cardinal directions
+                let mut occluded = 0_u8;
+                let offsets: [(i32, i32); 4] = [(r, 0), (-r, 0), (0, r), (0, -r)];
 
-                for &(kx, ky) in &SSAO_KERNEL {
-                    // Sample at multiple radii for better quality
-                    for scale in &[0.5_f32, 1.0, 1.5] {
-                        let sx = x as i32 + (kx * sample_radius * scale) as i32;
-                        let sy = y as i32 + (ky * sample_radius * scale) as i32;
+                for (dx, dy) in offsets {
+                    let sx = xi + dx;
+                    let sy = yi + dy;
 
-                        // Bounds check
-                        if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
-                            continue;
-                        }
-
+                    if sx >= 0 && sy >= 0 && (sx as usize) < width && (sy as usize) < height {
                         let s_idx = sy as usize * width + sx as usize;
-                        let sample_alpha = buffer.colors[s_idx].3;
-
-                        // Skip background samples
-                        if sample_alpha == 0 {
-                            continue;
-                        }
-
-                        let sample_depth = buffer.depth[s_idx];
-                        if sample_depth <= f32::NEG_INFINITY {
-                            continue;
-                        }
-
-                        valid_samples += 1;
-
-                        // If sample is significantly in front of center, center is occluded
-                        if sample_depth > center_depth + depth_threshold {
-                            // Weight by how much it occludes (closer occluders = stronger)
-                            let occlusion_strength = ((sample_depth - center_depth) / depth_range).min(1.0);
-                            if occlusion_strength > 0.02 {
-                                occluded_count += 1;
+                        if buffer.colors[s_idx].3 > 0 {
+                            let sample_depth = buffer.depth[s_idx];
+                            // If sample is in front, we're occluded
+                            if sample_depth > center_depth + 0.5 {
+                                occluded += 1;
                             }
                         }
                     }
                 }
 
-                // Compute occlusion factor
-                if valid_samples > 0 {
-                    let occ_ratio = occluded_count as f32 / valid_samples as f32;
-                    // Apply smooth falloff
-                    row[x] = (occ_ratio * strength).min(0.5);
+                if occluded > 0 {
+                    row[x] = (occluded as f32 * 0.15 * strength).min(0.4);
                 }
             }
 
@@ -807,44 +777,41 @@ pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
         })
         .collect();
 
-    // Apply occlusion darkening in linear space
+    // Apply darkening - simple multiply, skip sRGB conversion for speed
     buffer.colors
         .par_iter_mut()
         .zip(occlusion.par_iter())
         .for_each(|(color, &occ)| {
             if occ > 0.0 {
-                // Darken in linear space for physically correct result
-                let r_lin = srgb_to_linear(color.0);
-                let g_lin = srgb_to_linear(color.1);
-                let b_lin = srgb_to_linear(color.2);
-
                 let darken = 1.0 - occ;
                 *color = (
-                    linear_to_srgb(r_lin * darken),
-                    linear_to_srgb(g_lin * darken),
-                    linear_to_srgb(b_lin * darken),
+                    (color.0 as f32 * darken) as u8,
+                    (color.1 as f32 * darken) as u8,
+                    (color.2 as f32 * darken) as u8,
                     color.3,
                 );
             }
         });
 }
 
-/// ACES Filmic Tone Mapping curve
-/// Attempt to simulate the Academy Color Encoding System response
+/// Fast filmic tone curve applied directly to sRGB values
+/// Approximates ACES look without expensive color space conversions
 #[inline]
-fn aces_tonemap(x: f32) -> f32 {
-    // Simplified ACES approximation (Krzysztof Narkowicz)
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+fn fast_tonemap(x: u8, exposure: f32) -> u8 {
+    // Work in 0-1 range
+    let v = x as f32 / 255.0 * exposure;
+    // Simple S-curve: slight contrast boost with soft highlight rolloff
+    // Cheaper than full ACES but gives similar feel
+    let t = if v < 0.5 {
+        v * v * 2.0  // Darken shadows slightly
+    } else {
+        1.0 - (1.0 - v) * (1.0 - v) * 2.0  // Soft highlights
+    };
+    (t.clamp(0.0, 1.0) * 255.0) as u8
 }
 
-/// Apply ACES filmic tone mapping to the buffer for professional color reproduction.
-/// This maps HDR linear values to a pleasing display range with proper highlight rolloff.
-/// Uses parallel processing for performance.
+/// Apply fast tone mapping to the buffer for improved color reproduction.
+/// Optimized version that works directly on sRGB values.
 pub fn apply_tone_mapping(buffer: &mut PixelBuffer, exposure: f32) {
     buffer.colors
         .par_iter_mut()
@@ -853,21 +820,10 @@ pub fn apply_tone_mapping(buffer: &mut PixelBuffer, exposure: f32) {
                 return;
             }
 
-            // Convert to linear space
-            let r_lin = srgb_to_linear(color.0) * exposure;
-            let g_lin = srgb_to_linear(color.1) * exposure;
-            let b_lin = srgb_to_linear(color.2) * exposure;
-
-            // Apply ACES tone mapping
-            let r_tm = aces_tonemap(r_lin);
-            let g_tm = aces_tonemap(g_lin);
-            let b_tm = aces_tonemap(b_lin);
-
-            // Convert back to sRGB
             *color = (
-                linear_to_srgb(r_tm),
-                linear_to_srgb(g_tm),
-                linear_to_srgb(b_tm),
+                fast_tonemap(color.0, exposure),
+                fast_tonemap(color.1, exposure),
+                fast_tonemap(color.2, exposure),
                 color.3,
             );
         });
