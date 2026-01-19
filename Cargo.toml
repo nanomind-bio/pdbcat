@@ -23,6 +23,9 @@ thiserror = "1"
 # Compression for PNG encoding
 flate2 = "1"
 
+# Parallel processing
+rayon = "1.10"
+
 [dev-dependencies]
 # Testing
 

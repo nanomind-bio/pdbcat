@@ -2,6 +2,8 @@
 //!
 //! Stores per-pixel color and depth for image and half-block outputs.
 
+use rayon::prelude::*;
+
 /// A pixel buffer with depth testing.
 #[derive(Debug, Clone)]
 pub struct PixelBuffer {
@@ -222,7 +224,7 @@ impl PixelBuffer {
     }
 
     /// Draw a shaded cylinder (bond) between two points.
-    /// Creates a 3D tube appearance with lighting.
+    /// Uses filled disk rendering for solid appearance without gaps.
     pub fn draw_cylinder_shaded(
         &mut self,
         x0: f32,
@@ -242,9 +244,6 @@ impl PixelBuffer {
         if length < 0.1 {
             return;
         }
-
-        // Number of steps along the cylinder
-        let steps = (length * 2.0).max(2.0) as i32;
 
         // Light direction (same as spheres for consistency)
         let light = (0.4_f32, -0.5_f32, 0.76_f32);
@@ -290,49 +289,72 @@ impl PixelBuffer {
             axis.0 * perp1.1 - axis.1 * perp1.0,
         );
 
-        // Draw cylinder as series of circles
+        // Draw cylinder as series of filled disks
+        let steps = (length * 1.5).max(2.0) as i32;
+        let r2 = radius * radius;
+        let r_int = radius.ceil() as i32;
+
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             let cx = x0 + dx * t;
             let cy = y0 + dy * t;
             let cz = z0 + dz * t;
 
-            // Draw points around the circumference (more steps for smoother appearance)
-            let angle_steps = ((radius * 6.0).max(8.0) as i32).min(24);
-            for a in 0..angle_steps {
-                let angle = (a as f32 / angle_steps as f32) * std::f32::consts::TAU;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
+            // Fill the disk at this position
+            for local_y in -r_int..=r_int {
+                for local_x in -r_int..=r_int {
+                    let dist_sq = (local_x * local_x + local_y * local_y) as f32;
+                    if dist_sq > r2 {
+                        continue;
+                    }
 
-                // Normal on cylinder surface
-                let nx = perp1.0 * cos_a + perp2.0 * sin_a;
-                let ny = perp1.1 * cos_a + perp2.1 * sin_a;
-                let nz = perp1.2 * cos_a + perp2.2 * sin_a;
+                    // Convert local disk coordinates to world offset
+                    let lx = local_x as f32;
+                    let ly = local_y as f32;
 
-                let px = cx + nx * radius;
-                let py = cy + ny * radius;
-                let pz = cz + nz * radius;
+                    // Offset in world space using perpendicular vectors
+                    let wx = perp1.0 * lx + perp2.0 * ly;
+                    let wy = perp1.1 * lx + perp2.1 * ly;
+                    let wz = perp1.2 * lx + perp2.2 * ly;
 
-                // Diffuse lighting
-                let n_dot_l = (nx * light.0 + ny * light.1 + nz * light.2).max(0.0);
-                let diffuse = diffuse_strength * n_dot_l;
+                    let px = cx + wx;
+                    let py = cy + wy;
+                    let pz = cz + wz;
 
-                // Specular (Blinn-Phong)
-                let n_dot_h = (nx * half.0 + ny * half.1 + nz * half.2).max(0.0);
-                let specular = specular_strength * n_dot_h.powf(shininess);
+                    // Normal at this point (points outward from axis)
+                    let dist = dist_sq.sqrt().max(0.001);
+                    let nx = wx / dist;
+                    let ny = wy / dist;
+                    let nz_local = wz / dist;
 
-                // Rim lighting (based on view direction - nz component)
-                let n_dot_v = nz.abs(); // How much normal faces viewer
-                let rim = rim_strength * (1.0 - n_dot_v).powf(rim_power);
+                    // For depth, add z contribution from the cylinder surface
+                    let surface_z = if dist < radius {
+                        (r2 - dist_sq).sqrt() * 0.5  // Slight bulge for 3D effect
+                    } else {
+                        0.0
+                    };
 
-                let shade = (ambient + diffuse).min(1.0);
-                let shaded_color = (
-                    ((color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                    ((color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                    ((color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                );
+                    // Diffuse lighting
+                    let n_dot_l = (nx * light.0 + ny * light.1 + nz_local * light.2).max(0.0);
+                    let diffuse = diffuse_strength * n_dot_l;
 
-                self.set_pixel(px as i32, py as i32, pz, shaded_color);
+                    // Specular (Blinn-Phong)
+                    let n_dot_h = (nx * half.0 + ny * half.1 + nz_local * half.2).max(0.0);
+                    let specular = specular_strength * n_dot_h.powf(shininess);
+
+                    // Rim lighting
+                    let n_dot_v = nz_local.abs();
+                    let rim = rim_strength * (1.0 - n_dot_v).powf(rim_power);
+
+                    let shade = (ambient + diffuse).min(1.0);
+                    let shaded_color = (
+                        ((color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                        ((color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                        ((color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    );
+
+                    self.set_pixel(px as i32, py as i32, pz + surface_z, shaded_color);
+                }
             }
         }
     }
@@ -395,6 +417,7 @@ fn blend_color(color: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
 
 /// Downsample a buffer by 2x using box filtering for anti-aliasing.
 /// Returns a new buffer at half the dimensions.
+/// Uses parallel processing for improved performance.
 pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
     let dst_width = src.width() / 2;
     let dst_height = src.height() / 2;
@@ -403,44 +426,60 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
         return PixelBuffer::new(1, 1);
     }
 
-    let mut dst = PixelBuffer::new(dst_width, dst_height);
+    let src_width = src.width();
 
-    for y in 0..dst_height {
-        for x in 0..dst_width {
-            let mut r_sum: u32 = 0;
-            let mut g_sum: u32 = 0;
-            let mut b_sum: u32 = 0;
-            let mut a_sum: u32 = 0;
-            let mut max_z = f32::NEG_INFINITY;
+    // Compute each row in parallel
+    let results: Vec<(Vec<(u8, u8, u8, u8)>, Vec<f32>)> = (0..dst_height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row_colors = Vec::with_capacity(dst_width);
+            let mut row_depths = Vec::with_capacity(dst_width);
 
-            // Sample 2x2 block
-            for oy in 0..2 {
-                for ox in 0..2 {
-                    let sx = x * 2 + ox;
-                    let sy = y * 2 + oy;
-                    let (r, g, b, a) = src.get_pixel(sx, sy);
-                    r_sum += r as u32;
-                    g_sum += g as u32;
-                    b_sum += b as u32;
-                    a_sum += a as u32;
+            for x in 0..dst_width {
+                let mut r_sum: u32 = 0;
+                let mut g_sum: u32 = 0;
+                let mut b_sum: u32 = 0;
+                let mut a_sum: u32 = 0;
+                let mut max_z = f32::NEG_INFINITY;
 
-                    // Track max depth for depth buffer
-                    let idx = sy * src.width() + sx;
-                    if idx < src.depth.len() && src.depth[idx] > max_z {
-                        max_z = src.depth[idx];
+                // Sample 2x2 block
+                for oy in 0..2 {
+                    for ox in 0..2 {
+                        let sx = x * 2 + ox;
+                        let sy = y * 2 + oy;
+                        let (r, g, b, a) = src.get_pixel(sx, sy);
+                        r_sum += r as u32;
+                        g_sum += g as u32;
+                        b_sum += b as u32;
+                        a_sum += a as u32;
+
+                        let idx = sy * src_width + sx;
+                        if idx < src.depth.len() && src.depth[idx] > max_z {
+                            max_z = src.depth[idx];
+                        }
                     }
                 }
+
+                row_colors.push((
+                    (r_sum / 4) as u8,
+                    (g_sum / 4) as u8,
+                    (b_sum / 4) as u8,
+                    (a_sum / 4) as u8,
+                ));
+                row_depths.push(max_z);
             }
 
-            // Average colors
-            let avg_r = (r_sum / 4) as u8;
-            let avg_g = (g_sum / 4) as u8;
-            let avg_b = (b_sum / 4) as u8;
-            let avg_a = (a_sum / 4) as u8;
+            (row_colors, row_depths)
+        })
+        .collect();
 
+    // Assemble the final buffer
+    let mut dst = PixelBuffer::new(dst_width, dst_height);
+    for (y, (row_colors, row_depths)) in results.into_iter().enumerate() {
+        for (x, (color, depth)) in row_colors.into_iter().zip(row_depths).enumerate() {
             let idx = y * dst_width + x;
-            dst.colors[idx] = (avg_r, avg_g, avg_b, avg_a);
-            dst.depth[idx] = max_z;
+            dst.colors[idx] = color;
+            dst.depth[idx] = depth;
         }
     }
 
@@ -449,6 +488,7 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
 
 /// Apply silhouette edge detection to darken edges where depth changes sharply.
 /// This creates a ChimeraX-style outline effect that enhances depth perception.
+/// Uses parallel processing for improved performance.
 pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold: f32) {
     let width = buffer.width;
     let height = buffer.height;
@@ -457,65 +497,74 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold
         return;
     }
 
-    // Store edge intensities (we can't modify colors while reading neighbors)
-    let mut edge_factors: Vec<f32> = vec![0.0; width * height];
+    // Compute edge factors in parallel (one row at a time)
+    let edge_factors: Vec<f32> = (0..height)
+        .into_par_iter()
+        .flat_map(|y| {
+            let mut row = vec![0.0_f32; width];
 
-    // Sobel-like edge detection on depth buffer
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            let idx = y * width + x;
-
-            // Skip transparent pixels
-            if buffer.colors[idx].3 == 0 {
-                continue;
+            // Skip first and last rows (boundary)
+            if y == 0 || y == height - 1 {
+                return row;
             }
 
-            // Sample 3x3 neighborhood depths
-            let d_tl = buffer.depth[(y - 1) * width + (x - 1)];
-            let d_t  = buffer.depth[(y - 1) * width + x];
-            let d_tr = buffer.depth[(y - 1) * width + (x + 1)];
-            let d_l  = buffer.depth[y * width + (x - 1)];
-            let d_c  = buffer.depth[idx];
-            let d_r  = buffer.depth[y * width + (x + 1)];
-            let d_bl = buffer.depth[(y + 1) * width + (x - 1)];
-            let d_b  = buffer.depth[(y + 1) * width + x];
-            let d_br = buffer.depth[(y + 1) * width + (x + 1)];
+            for x in 1..width - 1 {
+                let idx = y * width + x;
 
-            // Sobel gradient (horizontal and vertical)
-            let gx = (d_tr + 2.0 * d_r + d_br) - (d_tl + 2.0 * d_l + d_bl);
-            let gy = (d_bl + 2.0 * d_b + d_br) - (d_tl + 2.0 * d_t + d_tr);
+                // Skip transparent pixels
+                if buffer.colors[idx].3 == 0 {
+                    continue;
+                }
 
-            // Gradient magnitude
-            let gradient = (gx * gx + gy * gy).sqrt();
+                // Sample 3x3 neighborhood depths
+                let d_tl = buffer.depth[(y - 1) * width + (x - 1)];
+                let d_t  = buffer.depth[(y - 1) * width + x];
+                let d_tr = buffer.depth[(y - 1) * width + (x + 1)];
+                let d_l  = buffer.depth[y * width + (x - 1)];
+                let d_r  = buffer.depth[y * width + (x + 1)];
+                let d_bl = buffer.depth[(y + 1) * width + (x - 1)];
+                let d_b  = buffer.depth[(y + 1) * width + x];
+                let d_br = buffer.depth[(y + 1) * width + (x + 1)];
 
-            // Also detect edges at object boundaries (large depth discontinuities)
-            let max_neighbor = d_tl.max(d_t).max(d_tr).max(d_l).max(d_r).max(d_bl).max(d_b).max(d_br);
-            let min_neighbor = d_tl.min(d_t).min(d_tr).min(d_l).min(d_r).min(d_bl).min(d_b).min(d_br);
-            let depth_range = max_neighbor - min_neighbor;
+                // Sobel gradient (horizontal and vertical)
+                let gx = (d_tr + 2.0 * d_r + d_br) - (d_tl + 2.0 * d_l + d_bl);
+                let gy = (d_bl + 2.0 * d_b + d_br) - (d_tl + 2.0 * d_t + d_tr);
 
-            // Combine gradient and depth discontinuity
-            let edge_strength = gradient.max(depth_range * 0.5);
+                // Gradient magnitude
+                let gradient = (gx * gx + gy * gy).sqrt();
 
-            if edge_strength > threshold {
-                // Normalize edge strength above threshold
-                let factor = ((edge_strength - threshold) * strength).min(0.7);
-                edge_factors[idx] = factor;
+                // Also detect edges at object boundaries (large depth discontinuities)
+                let max_neighbor = d_tl.max(d_t).max(d_tr).max(d_l).max(d_r).max(d_bl).max(d_b).max(d_br);
+                let min_neighbor = d_tl.min(d_t).min(d_tr).min(d_l).min(d_r).min(d_bl).min(d_b).min(d_br);
+                let depth_range = max_neighbor - min_neighbor;
+
+                // Combine gradient and depth discontinuity
+                let edge_strength = gradient.max(depth_range * 0.5);
+
+                if edge_strength > threshold {
+                    // Normalize edge strength above threshold
+                    let factor = ((edge_strength - threshold) * strength).min(0.7);
+                    row[x] = factor;
+                }
             }
-        }
-    }
 
-    // Apply darkening based on edge factors
-    for idx in 0..width * height {
-        let factor = edge_factors[idx];
-        if factor > 0.0 {
-            let (r, g, b, a) = buffer.colors[idx];
-            let darken = 1.0 - factor;
-            buffer.colors[idx] = (
-                (r as f32 * darken) as u8,
-                (g as f32 * darken) as u8,
-                (b as f32 * darken) as u8,
-                a,
-            );
-        }
-    }
+            row
+        })
+        .collect();
+
+    // Apply darkening in parallel using chunks
+    buffer.colors
+        .par_iter_mut()
+        .zip(edge_factors.par_iter())
+        .for_each(|(color, &factor)| {
+            if factor > 0.0 {
+                let darken = 1.0 - factor;
+                *color = (
+                    (color.0 as f32 * darken) as u8,
+                    (color.1 as f32 * darken) as u8,
+                    (color.2 as f32 * darken) as u8,
+                    color.3,
+                );
+            }
+        });
 }
