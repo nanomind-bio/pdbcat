@@ -169,10 +169,13 @@ impl PixelBuffer {
         // Ambient light factor
         let ambient = 0.15_f32;
         // Diffuse strength
-        let diffuse_strength = 0.7_f32;
+        let diffuse_strength = 0.65_f32;
         // Specular strength and shininess
-        let specular_strength = 0.4_f32;
+        let specular_strength = 0.35_f32;
         let shininess = 32.0_f32;
+        // Rim lighting strength (Fresnel-like edge highlight)
+        let rim_strength = 0.3_f32;
+        let rim_power = 2.5_f32;
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -202,12 +205,15 @@ impl PixelBuffer {
                 let n_dot_h = (nx * half.0 + ny * half.1 + nz * half.2).max(0.0);
                 let specular = specular_strength * n_dot_h.powf(shininess);
 
+                // Rim lighting (Fresnel-like effect at edges where nz approaches 0)
+                let rim = rim_strength * (1.0 - nz).powf(rim_power);
+
                 // Combine lighting
                 let shade = (ambient + diffuse).min(1.0);
                 let color = (
-                    ((base_color.0 as f32 * shade + 255.0 * specular).min(255.0)) as u8,
-                    ((base_color.1 as f32 * shade + 255.0 * specular).min(255.0)) as u8,
-                    ((base_color.2 as f32 * shade + 255.0 * specular).min(255.0)) as u8,
+                    ((base_color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    ((base_color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    ((base_color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
                 );
 
                 self.set_pixel(x, y, z, color);
@@ -240,10 +246,24 @@ impl PixelBuffer {
         // Number of steps along the cylinder
         let steps = (length * 2.0).max(2.0) as i32;
 
-        // Light direction
+        // Light direction (same as spheres for consistency)
         let light = (0.4_f32, -0.5_f32, 0.76_f32);
-        let ambient = 0.2_f32;
-        let diffuse_strength = 0.8_f32;
+        // View direction
+        let view = (0.0_f32, 0.0_f32, 1.0_f32);
+        // Halfway vector for specular
+        let h_len = ((light.0 + view.0).powi(2) + (light.1 + view.1).powi(2) + (light.2 + view.2).powi(2)).sqrt();
+        let half = (
+            (light.0 + view.0) / h_len,
+            (light.1 + view.1) / h_len,
+            (light.2 + view.2) / h_len,
+        );
+
+        let ambient = 0.15_f32;
+        let diffuse_strength = 0.65_f32;
+        let specular_strength = 0.25_f32;
+        let shininess = 24.0_f32;
+        let rim_strength = 0.2_f32;
+        let rim_power = 2.0_f32;
 
         // Perpendicular vectors to the cylinder axis
         let axis = (dx / length, dy / length, dz / length);
@@ -277,14 +297,14 @@ impl PixelBuffer {
             let cy = y0 + dy * t;
             let cz = z0 + dz * t;
 
-            // Draw points around the circumference
-            let angle_steps = ((radius * 4.0).max(4.0) as i32).min(16);
+            // Draw points around the circumference (more steps for smoother appearance)
+            let angle_steps = ((radius * 6.0).max(8.0) as i32).min(24);
             for a in 0..angle_steps {
                 let angle = (a as f32 / angle_steps as f32) * std::f32::consts::TAU;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
 
-                // Point on cylinder surface
+                // Normal on cylinder surface
                 let nx = perp1.0 * cos_a + perp2.0 * sin_a;
                 let ny = perp1.1 * cos_a + perp2.1 * sin_a;
                 let nz = perp1.2 * cos_a + perp2.2 * sin_a;
@@ -293,14 +313,23 @@ impl PixelBuffer {
                 let py = cy + ny * radius;
                 let pz = cz + nz * radius;
 
-                // Lighting
+                // Diffuse lighting
                 let n_dot_l = (nx * light.0 + ny * light.1 + nz * light.2).max(0.0);
-                let shade = (ambient + diffuse_strength * n_dot_l).min(1.0);
+                let diffuse = diffuse_strength * n_dot_l;
 
+                // Specular (Blinn-Phong)
+                let n_dot_h = (nx * half.0 + ny * half.1 + nz * half.2).max(0.0);
+                let specular = specular_strength * n_dot_h.powf(shininess);
+
+                // Rim lighting (based on view direction - nz component)
+                let n_dot_v = nz.abs(); // How much normal faces viewer
+                let rim = rim_strength * (1.0 - n_dot_v).powf(rim_power);
+
+                let shade = (ambient + diffuse).min(1.0);
                 let shaded_color = (
-                    (color.0 as f32 * shade) as u8,
-                    (color.1 as f32 * shade) as u8,
-                    (color.2 as f32 * shade) as u8,
+                    ((color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    ((color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    ((color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
                 );
 
                 self.set_pixel(px as i32, py as i32, pz, shaded_color);
