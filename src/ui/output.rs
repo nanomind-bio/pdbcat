@@ -323,7 +323,7 @@ fn encode_png_rgba(buffer: &PixelBuffer) -> Vec<u8> {
 }
 
 /// Encode as RGB PNG (3 bytes per pixel) - 25% smaller than RGBA
-fn encode_png_rgb(buffer: &PixelBuffer) -> Vec<u8> {
+pub fn encode_png_rgb(buffer: &PixelBuffer) -> Vec<u8> {
     let width = buffer.width() as u32;
     let height = buffer.height() as u32;
     let mut raw = Vec::with_capacity((buffer.width() * buffer.height() * 3) + buffer.height());

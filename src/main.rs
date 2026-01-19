@@ -25,6 +25,18 @@ struct Args {
     /// then output performance metrics to benchmark.log
     #[arg(long, short = 'b')]
     benchmark: bool,
+
+    /// Output a PNG image instead of running interactive viewer
+    #[arg(long, short = 'o', value_name = "OUTPUT")]
+    output: Option<PathBuf>,
+
+    /// Resolution for PNG output (WxH format, e.g., 800x600)
+    #[arg(long, short = 'r', default_value = "800x600")]
+    resolution: String,
+
+    /// Representation mode for PNG output (cartoon, ball-and-stick, surface, backbone)
+    #[arg(long, default_value = "cartoon")]
+    repr: String,
 }
 
 fn main() -> ExitCode {
@@ -64,8 +76,31 @@ fn main() -> ExitCode {
         }
     };
 
-    // Run the viewer
-    let result = if args.benchmark {
+    // Run the viewer or output PNG
+    let result = if let Some(output_path) = args.output {
+        // Parse resolution
+        let (width, height) = match parse_resolution(&args.resolution) {
+            Some(res) => res,
+            None => {
+                eprintln!("Error: Invalid resolution format '{}'. Expected WxH (e.g., 800x600)", args.resolution);
+                return ExitCode::from(1);
+            }
+        };
+
+        // Parse representation
+        let repr = match args.repr.to_lowercase().as_str() {
+            "cartoon" => render::Representation::Cartoon,
+            "ball-and-stick" | "ballandstick" | "bas" => render::Representation::BallAndStick,
+            "surface" => render::Representation::Surface,
+            "backbone" => render::Representation::Backbone,
+            _ => {
+                eprintln!("Error: Unknown representation '{}'. Use: cartoon, ball-and-stick, surface, backbone", args.repr);
+                return ExitCode::from(1);
+            }
+        };
+
+        ui::render_to_png(&args.file, molecule, &output_path, width, height, repr)
+    } else if args.benchmark {
         ui::run_benchmark(&args.file, molecule)
     } else {
         ui::run(&args.file, molecule)
@@ -77,4 +112,17 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn parse_resolution(s: &str) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = s.split('x').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let width = parts[0].parse().ok()?;
+    let height = parts[1].parse().ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }

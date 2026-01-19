@@ -619,16 +619,17 @@ impl App {
             }
             ColorScheme::SecondaryStructure => {
                 // Check secondary structure assignment
+                // Colors match PyMOL/ChimeraX conventions
                 for ss in &self.molecule.secondary_structure {
                     if ss.contains(atom.chain_id, atom.residue_seq) {
                         return match ss.ss_type {
-                            SecondaryStructure::Helix(_) => (255, 0, 255), // Magenta
-                            SecondaryStructure::Sheet => (255, 255, 0),    // Yellow
-                            SecondaryStructure::Coil => (255, 255, 255),   // White
+                            SecondaryStructure::Helix(_) => (0, 191, 255), // Cyan/light blue
+                            SecondaryStructure::Sheet => (255, 200, 50),   // Golden yellow
+                            SecondaryStructure::Coil => (200, 200, 200),   // Light gray
                         };
                     }
                 }
-                (255, 255, 255) // Default white for coil
+                (200, 200, 200) // Default light gray for coil
             }
         }
     }
@@ -820,16 +821,25 @@ impl App {
             proj_map[*idx] = Some(*info);
         }
 
-        // Size scale for ribbon widths - based on screen size, not position scale
-        // Target: helix ~3-5% of screen height, sheet ~2-4%, coil ~1-2%
+        // Size scale for ribbon widths - based on screen size with gentle molecule scaling
         let pixel_width = buffer.width() as f32;
         let pixel_height = buffer.height() as f32;
-        let ribbon_scale = pixel_height.min(pixel_width) / 40.0;
-        let helix_width = (1.8 * ribbon_scale).max(3.0);
-        let sheet_width = (1.4 * ribbon_scale).max(2.5);
-        let coil_width = (0.6 * ribbon_scale).max(1.5);
-        let arrow_length = (sheet_width * 1.6).max(4.0);
-        let arrow_width = (sheet_width * 1.8).max(4.0);
+        let screen_scale = pixel_height.min(pixel_width) / 50.0;
+
+        // Gentle scale adjustment for very large molecules only
+        let atom_count = self.molecule.atoms.len() as f32;
+        let complexity_scale = if atom_count > 2000.0 {
+            (2000.0 / atom_count).sqrt().max(0.5)
+        } else {
+            1.0
+        };
+
+        let ribbon_scale = screen_scale * complexity_scale;
+        let helix_width = (1.8 * ribbon_scale).max(4.0).min(20.0);
+        let sheet_width = (2.2 * ribbon_scale).max(5.0).min(25.0);
+        let coil_width = (0.6 * ribbon_scale).max(1.5).min(10.0);
+        let arrow_length = (sheet_width * 0.6).max(4.0).min(12.0);
+        let arrow_width = (sheet_width * 0.8).max(5.0).min(15.0);
 
         // For spline rendering, we need to collect chain segments
         if self.shading_enabled {
@@ -879,15 +889,16 @@ impl App {
                         let segment_dir = Vector2::new(info.x - px, info.y - py);
                         last_segment_dir = Some(segment_dir);
 
+                        // Use cylinder rendering for all - handles junctions properly
                         let width = match (&prev_ss, &ss) {
-                            (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
                             (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => sheet_width,
+                            (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
                             _ => coil_width,
                         };
                         self.draw_ribbon(buffer, px, py, pz, info.x, info.y, info.z, color, width);
 
                         if matches!(prev_ss, SecondaryStructure::Sheet) && !matches!(ss, SecondaryStructure::Sheet) {
-                            self.draw_arrowhead(buffer, px, py, pz, segment_dir, prev_color, arrow_length, arrow_width);
+                            buffer.draw_sheet_arrow(px, py, pz, segment_dir.x, segment_dir.y, arrow_length, arrow_width, prev_color);
                         }
                     } else {
                         last_segment_dir = None;
@@ -899,7 +910,7 @@ impl App {
 
         if let (Some((_, _, px, py, pz, color, ss)), Some(dir)) = (prev, last_segment_dir) {
             if matches!(ss, SecondaryStructure::Sheet) {
-                self.draw_arrowhead(buffer, px, py, pz, dir, color, arrow_length, arrow_width);
+                buffer.draw_sheet_arrow(px, py, pz, dir.x, dir.y, arrow_length, arrow_width, color);
             }
         }
     }
@@ -965,19 +976,19 @@ impl App {
             let p2 = (x2, y2, z2);
 
             // Determine width based on secondary structure
+            // Use cylinder rendering for all - handles junctions properly
             let width = match (&ss1, &ss2) {
-                (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
                 (SecondaryStructure::Sheet, _) | (_, SecondaryStructure::Sheet) => sheet_width,
+                (SecondaryStructure::Helix(_), _) | (_, SecondaryStructure::Helix(_)) => helix_width,
                 _ => coil_width,
             };
-
-            // Draw spline with shaded cylinders
             self.draw_spline_ribbon_shaded(buffer, p0, p1, p2, p3, c1, width);
 
-            // Draw arrowhead at end of sheets
+            // Draw 3D arrowhead at end of sheets
             if matches!(ss1, SecondaryStructure::Sheet) && !matches!(ss2, SecondaryStructure::Sheet) {
-                let dir = Vector2::new(x2 - x1, y2 - y1);
-                self.draw_arrowhead(buffer, x1, y1, z1, dir, c1, arrow_length, arrow_width);
+                let dir_x = x2 - x1;
+                let dir_y = y2 - y1;
+                buffer.draw_sheet_arrow(x1, y1, z1, dir_x, dir_y, arrow_length, arrow_width, c1);
             }
         }
 
@@ -986,8 +997,9 @@ impl App {
             let last = &segments[segments.len() - 1];
             let prev = &segments[segments.len() - 2];
             if last.5 == prev.5 && last.6 == prev.6 + 1 && matches!(last.4, SecondaryStructure::Sheet) {
-                let dir = Vector2::new(last.0 - prev.0, last.1 - prev.1);
-                self.draw_arrowhead(buffer, last.0, last.1, last.2, dir, last.3, arrow_length, arrow_width);
+                let dir_x = last.0 - prev.0;
+                let dir_y = last.1 - prev.1;
+                buffer.draw_sheet_arrow(last.0, last.1, last.2, dir_x, dir_y, arrow_length, arrow_width, last.3);
             }
         }
     }
@@ -1104,7 +1116,7 @@ impl App {
         buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, width * 0.5, color);
     }
 
-    /// Draw a smooth spline-based ribbon with shading
+    /// Draw a smooth spline-based ribbon with shading (for helices/coils)
     fn draw_spline_ribbon_shaded(
         &self,
         buffer: &mut PixelBuffer,
@@ -1141,6 +1153,51 @@ impl App {
                 + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
 
             self.draw_ribbon_shaded(buffer, prev_x, prev_y, prev_z, x, y, z, color, width);
+
+            prev_x = x;
+            prev_y = y;
+            prev_z = z;
+        }
+    }
+
+    /// Draw a smooth spline-based flat sheet (for beta strands)
+    fn draw_spline_sheet_shaded(
+        &self,
+        buffer: &mut PixelBuffer,
+        p0: (f32, f32, f32),
+        p1: (f32, f32, f32),
+        p2: (f32, f32, f32),
+        p3: (f32, f32, f32),
+        color: (u8, u8, u8),
+        width: f32,
+    ) {
+        let steps = 6;
+        let mut prev_x = p1.0;
+        let mut prev_y = p1.1;
+        let mut prev_z = p1.2;
+
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+
+            let x = 0.5 * ((2.0 * p1.0)
+                + (-p0.0 + p2.0) * t
+                + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+
+            let y = 0.5 * ((2.0 * p1.1)
+                + (-p0.1 + p2.1) * t
+                + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+
+            let z = 0.5 * ((2.0 * p1.2)
+                + (-p0.2 + p2.2) * t
+                + (2.0 * p0.2 - 5.0 * p1.2 + 4.0 * p2.2 - p3.2) * t2
+                + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
+
+            // Use flat sheet instead of cylinder for beta strands
+            buffer.draw_flat_sheet(prev_x, prev_y, prev_z, x, y, z, width, color);
 
             prev_x = x;
             prev_y = y;
@@ -1416,6 +1473,65 @@ pub fn run_benchmark(path: &Path, molecule: Molecule) -> Result<(), UiError> {
         avg(&clear_times), avg(&render_times), avg(&post_times));
     println!("Detailed results written to: {}", LOG_FILE);
 
+    Ok(())
+}
+
+/// Render molecule to a PNG file without interactive viewer
+pub fn render_to_png(
+    path: &Path,
+    molecule: Molecule,
+    output_path: &Path,
+    width: usize,
+    height: usize,
+    representation: Representation,
+) -> Result<(), UiError> {
+    use std::fs::File;
+    use std::io::Write;
+
+    eprintln!("Rendering {} to {} ({}x{})", path.display(), output_path.display(), width, height);
+
+    // Create a minimal app state for rendering
+    let render_backend = RenderBackend::HalfBlock; // Doesn't matter for PNG output
+    let mut app = App::new(path, molecule, render_backend);
+    app.representation = representation;
+    app.shading_enabled = true;
+    // Use chain coloring for cartoon mode - better for multi-chain structures
+    if matches!(representation, Representation::Cartoon) {
+        // Check if multi-chain structure
+        let chains: std::collections::HashSet<char> = app.molecule.atoms.iter()
+            .map(|a| a.chain_id)
+            .collect();
+        if chains.len() > 1 {
+            app.color_scheme = ColorScheme::Chain;
+        } else {
+            app.color_scheme = ColorScheme::SecondaryStructure;
+        }
+    }
+
+    // Create pixel buffer at desired resolution with white background
+    let mut buffer = PixelBuffer::new(width, height);
+    buffer.fill_background((255, 255, 255)); // White background
+
+    // Use 1:1 pixel mapping (no cell subdivision)
+    let pixels_per_cell = (1, 1);
+
+    // Render the molecule
+    app.render_molecule(&mut buffer, pixels_per_cell);
+
+    // Apply post-processing for professional look
+    apply_ssao(&mut buffer, 5.0, 0.5); // Subtle SSAO for depth
+    apply_edge_aa(&mut buffer, 0.25, 0.02); // Soft edge AA
+    apply_silhouette_edges(&mut buffer, 0.04, 0.15); // Very subtle outline
+    apply_tone_mapping(&mut buffer, 1.05);
+
+    // Encode to PNG
+    let png_data = output::encode_png_rgb(&buffer);
+
+    // Write to file
+    let mut file = File::create(output_path)?;
+    file.write_all(&png_data)?;
+
+    eprintln!("Wrote {} bytes to {}", png_data.len(), output_path.display());
     Ok(())
 }
 

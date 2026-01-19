@@ -410,6 +410,12 @@ impl PixelBuffer {
         self.depth.fill(f32::NEG_INFINITY);
     }
 
+    /// Fill the buffer with a solid background color
+    pub fn fill_background(&mut self, color: (u8, u8, u8)) {
+        self.colors.fill((color.0, color.1, color.2, 255));
+        self.depth.fill(f32::NEG_INFINITY);
+    }
+
     /// Resize the buffer if dimensions changed, otherwise just clear.
     /// Returns true if buffer was resized, false if only cleared.
     pub fn resize_or_clear(&mut self, width: usize, height: usize) -> bool {
@@ -835,6 +841,211 @@ impl PixelBuffer {
                 let blend = ((1.0 - fy) * 0.5) as f32;
                 let aa_color = blend_color(color, blend);
                 self.set_pixel(xi, yi + 1, z, aa_color);
+            }
+        }
+    }
+
+    /// Draw a flat ribbon/plank for beta sheets - uses filled rectangle approach
+    /// to avoid fanning artifacts on curves
+    pub fn draw_flat_sheet(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        z0: f32,
+        x1: f32,
+        y1: f32,
+        z1: f32,
+        width: f32,
+        color: (u8, u8, u8),
+    ) {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let length = (dx * dx + dy * dy).sqrt();
+        if length < 0.5 {
+            return;
+        }
+
+        // Use axis-aligned bounding box rasterization
+        let half_w = width * 0.5;
+
+        // Compute the 4 corners of the ribbon quad
+        let perp_x = -dy / length;
+        let perp_y = dx / length;
+
+        let c0x = x0 - perp_x * half_w;
+        let c0y = y0 - perp_y * half_w;
+        let c1x = x0 + perp_x * half_w;
+        let c1y = y0 + perp_y * half_w;
+        let c2x = x1 + perp_x * half_w;
+        let c2y = y1 + perp_y * half_w;
+        let c3x = x1 - perp_x * half_w;
+        let c3y = y1 - perp_y * half_w;
+
+        // Bounding box
+        let min_x = c0x.min(c1x).min(c2x).min(c3x).floor() as i32;
+        let max_x = c0x.max(c1x).max(c2x).max(c3x).ceil() as i32;
+        let min_y = c0y.min(c1y).min(c2y).min(c3y).floor() as i32;
+        let max_y = c0y.max(c1y).max(c2y).max(c3y).ceil() as i32;
+
+        // Shading setup
+        const KEY_DIR: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        const FILL_DIR: (f32, f32, f32) = (-0.5, 0.3, 0.81);
+        let nz = 1.0_f32;
+        let key_dot = (nz * KEY_DIR.2).max(0.0);
+        let fill_dot = (nz * FILL_DIR.2).max(0.0);
+        let ambient = 0.18;
+        let center_shade = ambient + 0.65 * key_dot + 0.25 * fill_dot;
+        let edge_shade = center_shade * 0.75;
+
+        let br = color.0 as f32 / 255.0;
+        let bg = color.1 as f32 / 255.0;
+        let bb = color.2 as f32 / 255.0;
+
+        // Direction vector (normalized)
+        let dir_x = dx / length;
+        let dir_y = dy / length;
+
+        // Rasterize using point-in-quad test
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let fx = px as f32 + 0.5;
+                let fy = py as f32 + 0.5;
+
+                // Project point onto ribbon axis
+                let to_pt_x = fx - x0;
+                let to_pt_y = fy - y0;
+
+                // Distance along the ribbon
+                let along = to_pt_x * dir_x + to_pt_y * dir_y;
+                if along < -0.5 || along > length + 0.5 {
+                    continue;
+                }
+
+                // Distance perpendicular to ribbon
+                let perp_dist = (to_pt_x * perp_x + to_pt_y * perp_y).abs();
+                if perp_dist > half_w + 0.5 {
+                    continue;
+                }
+
+                // Calculate z by interpolating along the ribbon
+                let t = (along / length).clamp(0.0, 1.0);
+                let z = z0 + (z1 - z0) * t;
+
+                // Edge shading based on perpendicular distance
+                let edge_factor = 1.0 - (perp_dist / half_w).min(1.0);
+                let shade = edge_shade + (center_shade - edge_shade) * edge_factor;
+
+                let r = (br * shade).min(1.0);
+                let g = (bg * shade).min(1.0);
+                let b = (bb * shade).min(1.0);
+
+                self.set_pixel(
+                    px,
+                    py,
+                    z,
+                    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8),
+                );
+            }
+        }
+    }
+
+    /// Draw a 3D arrow for beta sheet termini - uses triangle rasterization
+    pub fn draw_sheet_arrow(
+        &mut self,
+        tip_x: f32,
+        tip_y: f32,
+        tip_z: f32,
+        dir_x: f32,
+        dir_y: f32,
+        arrow_length: f32,
+        arrow_width: f32,
+        color: (u8, u8, u8),
+    ) {
+        let dir_len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+        if dir_len < 0.001 {
+            return;
+        }
+
+        let dx = dir_x / dir_len;
+        let dy = dir_y / dir_len;
+        let perp_x = -dy;
+        let perp_y = dx;
+
+        // Arrow base position
+        let base_x = tip_x - dx * arrow_length;
+        let base_y = tip_y - dy * arrow_length;
+        let half_w = arrow_width * 0.5;
+
+        // Triangle vertices: tip and two base corners
+        let v0 = (tip_x, tip_y); // tip
+        let v1 = (base_x - perp_x * half_w, base_y - perp_y * half_w); // left base
+        let v2 = (base_x + perp_x * half_w, base_y + perp_y * half_w); // right base
+
+        // Bounding box
+        let min_x = v0.0.min(v1.0).min(v2.0).floor() as i32;
+        let max_x = v0.0.max(v1.0).max(v2.0).ceil() as i32;
+        let min_y = v0.1.min(v1.1).min(v2.1).floor() as i32;
+        let max_y = v0.1.max(v1.1).max(v2.1).ceil() as i32;
+
+        // Shading setup
+        const KEY_DIR: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        const FILL_DIR: (f32, f32, f32) = (-0.5, 0.3, 0.81);
+        let nz = 1.0_f32;
+        let key_dot = (nz * KEY_DIR.2).max(0.0);
+        let fill_dot = (nz * FILL_DIR.2).max(0.0);
+        let ambient = 0.18;
+        let center_shade = ambient + 0.65 * key_dot + 0.25 * fill_dot;
+        let edge_shade = center_shade * 0.75;
+
+        let br = color.0 as f32 / 255.0;
+        let bg = color.1 as f32 / 255.0;
+        let bb = color.2 as f32 / 255.0;
+
+        // Helper: sign of cross product for point-in-triangle test
+        fn sign(p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> f32 {
+            (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1)
+        }
+
+        // Rasterize triangle
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let pt = (px as f32 + 0.5, py as f32 + 0.5);
+
+                // Point-in-triangle test using barycentric coordinates
+                let d1 = sign(pt, v0, v1);
+                let d2 = sign(pt, v1, v2);
+                let d3 = sign(pt, v2, v0);
+
+                let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+                let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+
+                if has_neg && has_pos {
+                    continue; // Outside triangle
+                }
+
+                // Calculate distance from center axis for shading
+                let to_pt_x = pt.0 - base_x;
+                let to_pt_y = pt.1 - base_y;
+                let perp_dist = (to_pt_x * perp_x + to_pt_y * perp_y).abs();
+                let along = to_pt_x * dx + to_pt_y * dy;
+                let max_width_at_pos = half_w * (1.0 - (along / arrow_length).clamp(0.0, 1.0));
+                let edge_factor = if max_width_at_pos > 0.01 {
+                    1.0 - (perp_dist / max_width_at_pos).min(1.0)
+                } else {
+                    1.0
+                };
+
+                let shade = edge_shade + (center_shade - edge_shade) * edge_factor;
+                let r = (br * shade).min(1.0);
+                let g = (bg * shade).min(1.0);
+                let b = (bb * shade).min(1.0);
+
+                self.set_pixel(
+                    px,
+                    py,
+                    tip_z,
+                    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8),
+                );
             }
         }
     }

@@ -82,18 +82,18 @@ impl ColorScheme {
 
 /// Get a color for a chain identifier
 pub fn chain_color(chain_id: char) -> (u8, u8, u8) {
-    // High-contrast categorical palette
+    // PyMOL/ChimeraX-style pleasant palette
     const CHAIN_COLORS: [(u8, u8, u8); 10] = [
-        (255, 0, 0),     // A - Red
-        (0, 0, 255),     // B - Blue
-        (0, 255, 0),     // C - Green
-        (255, 255, 0),   // D - Yellow
-        (255, 0, 255),   // E - Magenta
-        (0, 255, 255),   // F - Cyan
-        (255, 128, 0),   // G - Orange
-        (128, 0, 255),   // H - Purple
-        (0, 255, 128),   // I - Spring green
-        (255, 128, 128), // J - Light red
+        (30, 144, 255),  // A - Dodger blue
+        (255, 165, 0),   // B - Orange
+        (50, 205, 50),   // C - Lime green
+        (255, 99, 71),   // D - Tomato red
+        (138, 43, 226),  // E - Blue violet
+        (0, 206, 209),   // F - Dark turquoise
+        (255, 215, 0),   // G - Gold
+        (199, 21, 133),  // H - Medium violet red
+        (0, 191, 255),   // I - Deep sky blue
+        (255, 105, 180), // J - Hot pink
     ];
 
     let idx = match chain_id {
