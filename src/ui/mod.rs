@@ -357,8 +357,9 @@ impl App {
         let scale_x = base_scale;
         let scale_y = base_scale;
         let scale = base_scale;
-        // Screen scale for perspective projection - based on viewport size
-        let screen_scale = pixel_width.min(pixel_height) * 0.5 * self.camera.zoom;
+        // Screen scale for perspective projection - based on viewport size only
+        // Zoom is handled separately in camera.project_with_scale via self.zoom
+        let screen_scale = pixel_width.min(pixel_height) * 0.5;
 
         // Collect visible atoms with their screen positions per assembly instance
         let mut projected_instances: Vec<Vec<(usize, f32, f32, f32, (u8, u8, u8))>> = Vec::new();
