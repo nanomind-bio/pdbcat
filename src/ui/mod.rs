@@ -362,12 +362,13 @@ impl App {
         let screen_scale = pixel_width.min(pixel_height) * 0.5;
 
         // Collect visible atoms with their screen positions per assembly instance
-        let mut projected_instances: Vec<Vec<(usize, f32, f32, f32, (u8, u8, u8))>> = Vec::new();
+        // Now includes size_scale for perspective-correct sizing
+        let mut projected_instances: Vec<Vec<(usize, f32, f32, f32, f32, (u8, u8, u8))>> = Vec::new();
         let mut z_min = f32::INFINITY;
         let mut z_max = f32::NEG_INFINITY;
 
         for instance in &self.current_assembly().instances {
-            let mut projected: Vec<(usize, f32, f32, f32, (u8, u8, u8))> = Vec::new();
+            let mut projected: Vec<(usize, f32, f32, f32, f32, (u8, u8, u8))> = Vec::new();
             for (idx, atom) in self.molecule.atoms.iter().enumerate() {
                 if !self.is_atom_visible(atom) {
                     continue;
@@ -377,7 +378,7 @@ impl App {
                 }
 
                 let world = instance.transform.apply(atom.coord);
-                let (screen_pos, z) = self.camera.project_with_scale(world, screen_scale);
+                let (screen_pos, z, size_scale) = self.camera.project_with_scale(world, screen_scale);
                 let sx = center_x + screen_pos.x * scale_x;
                 let sy = center_y + screen_pos.y * scale_y;
 
@@ -387,7 +388,7 @@ impl App {
                 // Determine color based on scheme
                 let color = self.get_atom_color(atom, idx);
 
-                projected.push((idx, sx, sy, z, color));
+                projected.push((idx, sx, sy, z, size_scale, color));
             }
 
             // Sort by depth (back to front)
@@ -440,7 +441,7 @@ impl App {
     fn render_backbone(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
         _scale: f32,
         z_min: f32,
         z_max: f32,
@@ -457,10 +458,10 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        // Create a map from atom index to projected position
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))> = projected
+        // Create a map from atom index to projected position (includes size_scale)
+        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
             .iter()
-            .map(|(idx, x, y, z, c)| (*idx, (*x, *y, *z, *c)))
+            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
             .collect();
 
         // Draw lines between consecutive backbone atoms in same chain
@@ -468,7 +469,7 @@ impl App {
 
         for &idx in &backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, color)) = proj_map.get(&idx) {
+            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
                 let color = if self.shading_enabled {
                     depth_cue(*color, *z, z_max, z_min)
                 } else {
@@ -490,26 +491,28 @@ impl App {
     fn render_ball_and_stick(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
         scale: f32,
         z_min: f32,
         z_max: f32,
     ) {
         use crate::render::braille::depth_cue;
 
-        // Create a map from atom index to projected position
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))> = projected
+        // Create a map from atom index to projected position (includes size_scale)
+        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
             .iter()
-            .map(|(idx, x, y, z, c)| (*idx, (*x, *y, *z, *c)))
+            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
             .collect();
 
         // Draw bonds first (behind atoms)
-        let bond_radius = scale * 0.08; // Cylinder radius for bonds
         for bond in &self.molecule.bonds {
-            if let (Some(&(x1, y1, z1, c1)), Some(&(x2, y2, z2, _c2))) =
+            if let (Some(&(x1, y1, z1, ss1, c1)), Some(&(x2, y2, z2, ss2, _c2))) =
                 (proj_map.get(&bond.atom1), proj_map.get(&bond.atom2))
             {
                 let avg_z = (z1 + z2) / 2.0;
+                // Use average size_scale for bond radius (perspective-correct)
+                let avg_size_scale = (ss1 + ss2) / 2.0;
+                let bond_radius = scale * 0.08 * avg_size_scale / self.camera.zoom;
                 let color = if self.shading_enabled {
                     depth_cue(c1, avg_z, z_max, z_min)
                 } else {
@@ -517,7 +520,7 @@ impl App {
                 };
                 if self.shading_enabled && bond_radius > 1.0 {
                     // Use shaded cylinders for hi-fi rendering
-                    buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, bond_radius.min(3.0), color);
+                    buffer.draw_cylinder_shaded(x1, y1, z1, x2, y2, z2, bond_radius.min(4.0), color);
                 } else {
                     buffer.draw_line(x1, y1, z1, x2, y2, z2, color);
                 }
@@ -525,9 +528,10 @@ impl App {
         }
 
         // Draw atoms with Blinn-Phong shading when enabled
-        for (idx, x, y, z, color) in projected {
+        for (idx, x, y, z, size_scale, color) in projected {
             let atom = &self.molecule.atoms[*idx];
-            let radius = atom.vdw_radius() * scale * 0.15; // Scale down for visibility
+            // Use size_scale for perspective-correct radius (divide by base zoom to normalize)
+            let radius = atom.vdw_radius() * scale * 0.15 * size_scale / self.camera.zoom;
             let color = if self.shading_enabled {
                 depth_cue(*color, *z, z_max, z_min)
             } else {
@@ -544,7 +548,7 @@ impl App {
     fn render_surface(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
         scale: f32,
         z_min: f32,
         z_max: f32,
@@ -554,9 +558,10 @@ impl App {
         let probe_radius = 1.4_f32;
         let surface_scale = 0.15_f32;
 
-        for (idx, x, y, z, color) in projected {
+        for (idx, x, y, z, size_scale, color) in projected {
             let atom = &self.molecule.atoms[*idx];
-            let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale;
+            // Use size_scale for perspective-correct radius
+            let radius = (atom.vdw_radius() + probe_radius) * scale * surface_scale * size_scale / self.camera.zoom;
             let color = if self.shading_enabled {
                 depth_cue(*color, *z, z_max, z_min)
             } else {
@@ -574,13 +579,11 @@ impl App {
     fn render_cartoon(
         &self,
         buffer: &mut PixelBuffer,
-        projected: &[(usize, f32, f32, f32, (u8, u8, u8))],
+        projected: &[(usize, f32, f32, f32, f32, (u8, u8, u8))],
         _scale: f32,
         z_min: f32,
         z_max: f32,
     ) {
-        use crate::render::braille::depth_cue;
-
         // Get backbone atoms (CA for proteins, P for nucleic acids)
         let backbone_indices: Vec<usize> = self
             .molecule
@@ -591,20 +594,20 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        // Create a map from atom index to projected position
-        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))> = projected
+        // Create a map from atom index to projected position (includes size_scale)
+        let proj_map: std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))> = projected
             .iter()
-            .map(|(idx, x, y, z, c)| (*idx, (*x, *y, *z, *c)))
+            .map(|(idx, x, y, z, ss, c)| (*idx, (*x, *y, *z, *ss, *c)))
             .collect();
 
         // Size scale for ribbon widths - based on screen size, not position scale
         // Target: helix ~3-5% of screen height, sheet ~2-4%, coil ~1-2%
         let pixel_width = buffer.width() as f32;
         let pixel_height = buffer.height() as f32;
-        let size_scale = pixel_height.min(pixel_width) / 40.0;
-        let helix_width = (1.8 * size_scale).max(3.0);
-        let sheet_width = (1.4 * size_scale).max(2.5);
-        let coil_width = (0.6 * size_scale).max(1.5);
+        let ribbon_scale = pixel_height.min(pixel_width) / 40.0;
+        let helix_width = (1.8 * ribbon_scale).max(3.0);
+        let sheet_width = (1.4 * ribbon_scale).max(2.5);
+        let coil_width = (0.6 * ribbon_scale).max(1.5);
         let arrow_length = (sheet_width * 1.6).max(4.0);
         let arrow_width = (sheet_width * 1.8).max(4.0);
 
@@ -631,7 +634,7 @@ impl App {
         &self,
         buffer: &mut PixelBuffer,
         backbone_indices: &[usize],
-        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))>,
+        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))>,
         helix_width: f32,
         sheet_width: f32,
         coil_width: f32,
@@ -647,7 +650,7 @@ impl App {
 
         for &idx in backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, color)) = proj_map.get(&idx) {
+            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
                 let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
                 let color = depth_cue(*color, *z, z_max, z_min);
 
@@ -686,7 +689,7 @@ impl App {
         &self,
         buffer: &mut PixelBuffer,
         backbone_indices: &[usize],
-        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, (u8, u8, u8))>,
+        proj_map: &std::collections::HashMap<usize, (f32, f32, f32, f32, (u8, u8, u8))>,
         helix_width: f32,
         sheet_width: f32,
         coil_width: f32,
@@ -702,7 +705,7 @@ impl App {
 
         for &idx in backbone_indices {
             let atom = &self.molecule.atoms[idx];
-            if let Some((x, y, z, color)) = proj_map.get(&idx) {
+            if let Some((x, y, z, _size_scale, color)) = proj_map.get(&idx) {
                 let ss = self.get_secondary_structure(atom.chain_id, atom.residue_seq);
                 let color = depth_cue(*color, *z, z_max, z_min);
                 segments.push((*x, *y, *z, color, ss, atom.chain_id, atom.residue_seq));

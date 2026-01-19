@@ -4,6 +4,31 @@
 
 use rayon::prelude::*;
 
+/// Convert sRGB color component (0-255) to linear color space (0.0-1.0)
+/// Uses the exact sRGB transfer function
+#[inline]
+fn srgb_to_linear(c: u8) -> f32 {
+    let c = c as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Convert linear color component (0.0-1.0) to sRGB (0-255)
+/// Uses the exact sRGB transfer function
+#[inline]
+fn linear_to_srgb(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let v = if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (v * 255.0 + 0.5) as u8
+}
+
 /// A pixel buffer with depth testing.
 #[derive(Debug, Clone)]
 pub struct PixelBuffer {
@@ -135,7 +160,7 @@ impl PixelBuffer {
         }
     }
 
-    /// Draw a shaded sphere using Blinn-Phong lighting model.
+    /// Draw a shaded sphere using Blinn-Phong lighting model with gamma-correct shading.
     /// Creates a 3D appearance with diffuse and specular highlights.
     pub fn draw_sphere_shaded(
         &mut self,
@@ -150,11 +175,22 @@ impl PixelBuffer {
             return;
         }
 
-        // Light direction (normalized) - from upper-left-front
-        let light = (0.4_f32, -0.5_f32, 0.76_f32);
+        // Convert base color to linear space for correct lighting math
+        let base_linear = (
+            srgb_to_linear(base_color.0),
+            srgb_to_linear(base_color.1),
+            srgb_to_linear(base_color.2),
+        );
+
+        // Key light direction (normalized) - from upper-left-front
+        let light_len = (0.4_f32 * 0.4 + 0.5 * 0.5 + 0.76 * 0.76).sqrt();
+        let light = (0.4_f32 / light_len, -0.5_f32 / light_len, 0.76_f32 / light_len);
+        // Fill light from opposite side (softer, dimmer)
+        let fill_light = (-0.3_f32, 0.2_f32, 0.5_f32);
+        let fill_strength = 0.25_f32;
         // View direction (towards viewer)
         let view = (0.0_f32, 0.0_f32, 1.0_f32);
-        // Halfway vector for Blinn-Phong
+        // Halfway vector for Blinn-Phong (key light)
         let h_len = ((light.0 + view.0).powi(2) + (light.1 + view.1).powi(2) + (light.2 + view.2).powi(2)).sqrt();
         let half = (
             (light.0 + view.0) / h_len,
@@ -168,15 +204,12 @@ impl PixelBuffer {
         let min_y = (cy - radius).floor() as i32;
         let max_y = (cy + radius).ceil() as i32;
 
-        // Ambient light factor
-        let ambient = 0.15_f32;
-        // Diffuse strength
-        let diffuse_strength = 0.65_f32;
-        // Specular strength and shininess
-        let specular_strength = 0.35_f32;
-        let shininess = 32.0_f32;
-        // Rim lighting strength (Fresnel-like edge highlight)
-        let rim_strength = 0.3_f32;
+        // Lighting parameters
+        let ambient = 0.12_f32;
+        let diffuse_strength = 0.70_f32;
+        let specular_strength = 0.40_f32;
+        let shininess = 40.0_f32;
+        let rim_strength = 0.25_f32;
         let rim_power = 2.5_f32;
 
         for y in min_y..=max_y {
@@ -199,23 +232,38 @@ impl PixelBuffer {
                 let ny = dy * inv_r;
                 let nz = dz * inv_r;
 
-                // Diffuse component (Lambert)
+                // Key light diffuse (Lambert)
                 let n_dot_l = (nx * light.0 + ny * light.1 + nz * light.2).max(0.0);
                 let diffuse = diffuse_strength * n_dot_l;
 
-                // Specular component (Blinn-Phong)
+                // Fill light diffuse (softer shadows)
+                let n_dot_fill = (nx * fill_light.0 + ny * fill_light.1 + nz * fill_light.2).max(0.0);
+                let fill_diffuse = fill_strength * n_dot_fill;
+
+                // Specular component (Blinn-Phong) - GATED by n_dot_l
                 let n_dot_h = (nx * half.0 + ny * half.1 + nz * half.2).max(0.0);
-                let specular = specular_strength * n_dot_h.powf(shininess);
+                let specular = if n_dot_l > 0.0 {
+                    specular_strength * n_dot_h.powf(shininess)
+                } else {
+                    0.0
+                };
 
                 // Rim lighting (Fresnel-like effect at edges where nz approaches 0)
                 let rim = rim_strength * (1.0 - nz).powf(rim_power);
 
-                // Combine lighting
-                let shade = (ambient + diffuse).min(1.0);
+                // Combine lighting in linear space
+                let shade = ambient + diffuse + fill_diffuse;
+                let lit = (
+                    base_linear.0 * shade + specular + rim * base_linear.0,
+                    base_linear.1 * shade + specular + rim * base_linear.1,
+                    base_linear.2 * shade + specular + rim * base_linear.2,
+                );
+
+                // Convert back to sRGB
                 let color = (
-                    ((base_color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                    ((base_color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                    ((base_color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                    linear_to_srgb(lit.0),
+                    linear_to_srgb(lit.1),
+                    linear_to_srgb(lit.2),
                 );
 
                 self.set_pixel(x, y, z, color);
@@ -223,7 +271,7 @@ impl PixelBuffer {
         }
     }
 
-    /// Draw a shaded cylinder (bond) between two points.
+    /// Draw a shaded cylinder (bond) between two points with gamma-correct shading.
     /// Uses filled disk rendering for solid appearance without gaps.
     pub fn draw_cylinder_shaded(
         &mut self,
@@ -245,8 +293,19 @@ impl PixelBuffer {
             return;
         }
 
-        // Light direction (same as spheres for consistency)
-        let light = (0.4_f32, -0.5_f32, 0.76_f32);
+        // Convert base color to linear space
+        let base_linear = (
+            srgb_to_linear(color.0),
+            srgb_to_linear(color.1),
+            srgb_to_linear(color.2),
+        );
+
+        // Key light direction (normalized) - same as spheres for consistency
+        let light_len = (0.4_f32 * 0.4 + 0.5 * 0.5 + 0.76 * 0.76).sqrt();
+        let light = (0.4_f32 / light_len, -0.5_f32 / light_len, 0.76_f32 / light_len);
+        // Fill light from opposite side
+        let fill_light = (-0.3_f32, 0.2_f32, 0.5_f32);
+        let fill_strength = 0.25_f32;
         // View direction
         let view = (0.0_f32, 0.0_f32, 1.0_f32);
         // Halfway vector for specular
@@ -257,11 +316,12 @@ impl PixelBuffer {
             (light.2 + view.2) / h_len,
         );
 
-        let ambient = 0.15_f32;
-        let diffuse_strength = 0.65_f32;
-        let specular_strength = 0.25_f32;
-        let shininess = 24.0_f32;
-        let rim_strength = 0.2_f32;
+        // Lighting parameters
+        let ambient = 0.12_f32;
+        let diffuse_strength = 0.70_f32;
+        let specular_strength = 0.30_f32;
+        let shininess = 32.0_f32;
+        let rim_strength = 0.15_f32;
         let rim_power = 2.0_f32;
 
         // Perpendicular vectors to the cylinder axis
@@ -334,23 +394,39 @@ impl PixelBuffer {
                         0.0
                     };
 
-                    // Diffuse lighting
+                    // Key light diffuse
                     let n_dot_l = (nx * light.0 + ny * light.1 + nz_local * light.2).max(0.0);
                     let diffuse = diffuse_strength * n_dot_l;
 
-                    // Specular (Blinn-Phong)
+                    // Fill light diffuse
+                    let n_dot_fill = (nx * fill_light.0 + ny * fill_light.1 + nz_local * fill_light.2).max(0.0);
+                    let fill_diffuse = fill_strength * n_dot_fill;
+
+                    // Specular (Blinn-Phong) - GATED by n_dot_l
                     let n_dot_h = (nx * half.0 + ny * half.1 + nz_local * half.2).max(0.0);
-                    let specular = specular_strength * n_dot_h.powf(shininess);
+                    let specular = if n_dot_l > 0.0 {
+                        specular_strength * n_dot_h.powf(shininess)
+                    } else {
+                        0.0
+                    };
 
                     // Rim lighting
                     let n_dot_v = nz_local.abs();
                     let rim = rim_strength * (1.0 - n_dot_v).powf(rim_power);
 
-                    let shade = (ambient + diffuse).min(1.0);
+                    // Combine lighting in linear space
+                    let shade = ambient + diffuse + fill_diffuse;
+                    let lit = (
+                        base_linear.0 * shade + specular + rim * base_linear.0,
+                        base_linear.1 * shade + specular + rim * base_linear.1,
+                        base_linear.2 * shade + specular + rim * base_linear.2,
+                    );
+
+                    // Convert back to sRGB
                     let shaded_color = (
-                        ((color.0 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                        ((color.1 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
-                        ((color.2 as f32 * shade + 255.0 * (specular + rim)).min(255.0)) as u8,
+                        linear_to_srgb(lit.0),
+                        linear_to_srgb(lit.1),
+                        linear_to_srgb(lit.2),
                     );
 
                     self.set_pixel(px as i32, py as i32, pz + surface_z, shaded_color);

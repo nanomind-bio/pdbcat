@@ -100,13 +100,16 @@ impl Camera {
     ///
     /// For perspective projection, the `screen_scale` parameter determines
     /// the distance from camera to the projection plane.
-    pub fn project(&self, point: Vector3<f32>) -> (Vector2<f32>, f32) {
+    /// Returns (screen_position, depth, size_scale) where size_scale should be
+    /// applied to radii/widths to maintain correct perspective sizing.
+    pub fn project(&self, point: Vector3<f32>) -> (Vector2<f32>, f32, f32) {
         self.project_with_scale(point, 1.0)
     }
 
     /// Transform a 3D point to screen coordinates with a screen scale factor.
-    /// This is used for perspective projection to control the viewing distance.
-    pub fn project_with_scale(&self, point: Vector3<f32>, screen_scale: f32) -> (Vector2<f32>, f32) {
+    /// Returns (screen_position, depth, size_scale) where size_scale should be
+    /// multiplied by radii/widths to maintain correct perspective sizing.
+    pub fn project_with_scale(&self, point: Vector3<f32>, screen_scale: f32) -> (Vector2<f32>, f32, f32) {
         // Translate to center of rotation
         let centered = point - self.center;
 
@@ -121,7 +124,8 @@ impl Camera {
                 // Apply translation
                 let screen_x = scaled.x + self.translation.x;
                 let screen_y = scaled.y + self.translation.y;
-                (Vector2::new(screen_x, screen_y), scaled.z)
+                // Size scale is just zoom for orthographic
+                (Vector2::new(screen_x, screen_y), scaled.z, self.zoom)
             }
             ProjectionMode::Perspective => {
                 // Perspective division
@@ -138,8 +142,8 @@ impl Camera {
                 let screen_x = scaled.x * perspective_factor + self.translation.x;
                 let screen_y = scaled.y * perspective_factor + self.translation.y;
 
-                // Return screen position and depth
-                (Vector2::new(screen_x, screen_y), scaled.z)
+                // Size scale includes both zoom and perspective factor
+                (Vector2::new(screen_x, screen_y), scaled.z, self.zoom * perspective_factor)
             }
         }
     }
@@ -191,11 +195,13 @@ mod tests {
         let near_point = Vector3::new(10.0, 0.0, 5.0);
         let far_point = Vector3::new(10.0, 0.0, -5.0);
 
-        let (near_screen, _) = camera.project_with_scale(near_point, 100.0);
-        let (far_screen, _) = camera.project_with_scale(far_point, 100.0);
+        let (near_screen, _, near_size) = camera.project_with_scale(near_point, 100.0);
+        let (far_screen, _, far_size) = camera.project_with_scale(far_point, 100.0);
 
         // Near point should appear larger (further from center)
         assert!(near_screen.x.abs() > far_screen.x.abs());
+        // Near point should have larger size_scale
+        assert!(near_size > far_size);
     }
 }
 
