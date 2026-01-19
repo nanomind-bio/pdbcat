@@ -494,6 +494,7 @@ fn blend_color(color: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
 /// Downsample a buffer by 2x using box filtering for anti-aliasing.
 /// Returns a new buffer at half the dimensions.
 /// Uses parallel processing for improved performance.
+/// IMPORTANT: Blends in linear color space for correct anti-aliasing.
 pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
     let dst_width = src.width() / 2;
     let dst_height = src.height() / 2;
@@ -512,10 +513,11 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
             let mut row_depths = Vec::with_capacity(dst_width);
 
             for x in 0..dst_width {
-                let mut r_sum: u32 = 0;
-                let mut g_sum: u32 = 0;
-                let mut b_sum: u32 = 0;
-                let mut a_sum: u32 = 0;
+                // Linear-space accumulation with alpha weighting
+                let mut r_lin: f32 = 0.0;
+                let mut g_lin: f32 = 0.0;
+                let mut b_lin: f32 = 0.0;
+                let mut a_sum: f32 = 0.0;
                 let mut max_z = f32::NEG_INFINITY;
 
                 // Sample 2x2 block
@@ -524,10 +526,13 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
                         let sx = x * 2 + ox;
                         let sy = y * 2 + oy;
                         let (r, g, b, a) = src.get_pixel(sx, sy);
-                        r_sum += r as u32;
-                        g_sum += g as u32;
-                        b_sum += b as u32;
-                        a_sum += a as u32;
+
+                        // Convert to linear space and weight by alpha
+                        let alpha = a as f32 / 255.0;
+                        r_lin += srgb_to_linear(r) * alpha;
+                        g_lin += srgb_to_linear(g) * alpha;
+                        b_lin += srgb_to_linear(b) * alpha;
+                        a_sum += alpha;
 
                         let idx = sy * src_width + sx;
                         if idx < src.depth.len() && src.depth[idx] > max_z {
@@ -536,12 +541,19 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
                     }
                 }
 
-                row_colors.push((
-                    (r_sum / 4) as u8,
-                    (g_sum / 4) as u8,
-                    (b_sum / 4) as u8,
-                    (a_sum / 4) as u8,
-                ));
+                // Normalize and convert back to sRGB
+                let (r, g, b, a) = if a_sum > 0.0 {
+                    (
+                        linear_to_srgb(r_lin / a_sum),
+                        linear_to_srgb(g_lin / a_sum),
+                        linear_to_srgb(b_lin / a_sum),
+                        (a_sum * 255.0 / 4.0) as u8,
+                    )
+                } else {
+                    (0, 0, 0, 0)
+                };
+
+                row_colors.push((r, g, b, a));
                 row_depths.push(max_z);
             }
 
@@ -565,13 +577,31 @@ pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
 /// Apply silhouette edge detection to darken edges where depth changes sharply.
 /// This creates a ChimeraX-style outline effect that enhances depth perception.
 /// Uses parallel processing for improved performance.
-pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold: f32) {
+/// Now uses normalized depth thresholds relative to scene depth range.
+pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, _threshold: f32) {
     let width = buffer.width;
     let height = buffer.height;
 
     if width < 3 || height < 3 {
         return;
     }
+
+    // Find the depth range of visible pixels (excluding background)
+    let (min_depth, max_depth) = buffer.depth
+        .par_iter()
+        .filter(|&&d| d > f32::NEG_INFINITY)
+        .fold(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(min_d, max_d), &d| (min_d.min(d), max_d.max(d)),
+        )
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(a_min, a_max), (b_min, b_max)| (a_min.min(b_min), a_max.max(b_max)),
+        );
+
+    let depth_range = (max_depth - min_depth).max(1.0);
+    // Normalized threshold: detect edges at ~2% of depth range
+    let norm_threshold = depth_range * 0.02;
 
     // Compute edge factors in parallel (one row at a time)
     let edge_factors: Vec<f32> = (0..height)
@@ -592,34 +622,57 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold
                     continue;
                 }
 
-                // Sample 3x3 neighborhood depths
-                let d_tl = buffer.depth[(y - 1) * width + (x - 1)];
-                let d_t  = buffer.depth[(y - 1) * width + x];
-                let d_tr = buffer.depth[(y - 1) * width + (x + 1)];
-                let d_l  = buffer.depth[y * width + (x - 1)];
-                let d_r  = buffer.depth[y * width + (x + 1)];
-                let d_bl = buffer.depth[(y + 1) * width + (x - 1)];
-                let d_b  = buffer.depth[(y + 1) * width + x];
-                let d_br = buffer.depth[(y + 1) * width + (x + 1)];
+                let center_depth = buffer.depth[idx];
+
+                // Skip if center is background (shouldn't happen since we check alpha)
+                if center_depth <= f32::NEG_INFINITY {
+                    continue;
+                }
+
+                // Sample 3x3 neighborhood depths, treating background as center depth
+                // to avoid halos at object boundaries
+                let sample = |dx: i32, dy: i32| -> f32 {
+                    let nx = (x as i32 + dx) as usize;
+                    let ny = (y as i32 + dy) as usize;
+                    let n_idx = ny * width + nx;
+                    let n_alpha = buffer.colors[n_idx].3;
+                    let n_depth = buffer.depth[n_idx];
+                    // If neighbor is background/transparent, use center depth
+                    if n_alpha == 0 || n_depth <= f32::NEG_INFINITY {
+                        center_depth
+                    } else {
+                        n_depth
+                    }
+                };
+
+                let d_tl = sample(-1, -1);
+                let d_t  = sample(0, -1);
+                let d_tr = sample(1, -1);
+                let d_l  = sample(-1, 0);
+                let d_r  = sample(1, 0);
+                let d_bl = sample(-1, 1);
+                let d_b  = sample(0, 1);
+                let d_br = sample(1, 1);
 
                 // Sobel gradient (horizontal and vertical)
                 let gx = (d_tr + 2.0 * d_r + d_br) - (d_tl + 2.0 * d_l + d_bl);
                 let gy = (d_bl + 2.0 * d_b + d_br) - (d_tl + 2.0 * d_t + d_tr);
 
-                // Gradient magnitude
+                // Gradient magnitude normalized to depth range
                 let gradient = (gx * gx + gy * gy).sqrt();
 
-                // Also detect edges at object boundaries (large depth discontinuities)
+                // Also detect edges between objects at different depths
                 let max_neighbor = d_tl.max(d_t).max(d_tr).max(d_l).max(d_r).max(d_bl).max(d_b).max(d_br);
                 let min_neighbor = d_tl.min(d_t).min(d_tr).min(d_l).min(d_r).min(d_bl).min(d_b).min(d_br);
-                let depth_range = max_neighbor - min_neighbor;
+                let local_range = max_neighbor - min_neighbor;
 
                 // Combine gradient and depth discontinuity
-                let edge_strength = gradient.max(depth_range * 0.5);
+                let edge_strength = gradient.max(local_range * 0.5);
 
-                if edge_strength > threshold {
-                    // Normalize edge strength above threshold
-                    let factor = ((edge_strength - threshold) * strength).min(0.7);
+                if edge_strength > norm_threshold {
+                    // Normalize edge strength to 0-1 range, then apply strength
+                    let normalized = ((edge_strength - norm_threshold) / depth_range).min(1.0);
+                    let factor = (normalized * strength * 2.0).min(0.7);
                     row[x] = factor;
                 }
             }
@@ -642,5 +695,180 @@ pub fn apply_silhouette_edges(buffer: &mut PixelBuffer, strength: f32, threshold
                     color.3,
                 );
             }
+        });
+}
+
+/// SSAO sample kernel - Poisson disk offsets for ambient occlusion sampling
+const SSAO_KERNEL: [(f32, f32); 12] = [
+    (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+    (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707),
+    (0.5, 0.866), (-0.5, 0.866), (0.5, -0.866), (-0.5, -0.866),
+];
+
+/// Apply Screen Space Ambient Occlusion for enhanced depth perception.
+/// Creates soft shadows in crevices and contact areas between objects.
+/// Uses parallel processing for performance.
+pub fn apply_ssao(buffer: &mut PixelBuffer, radius: f32, strength: f32) {
+    let width = buffer.width;
+    let height = buffer.height;
+
+    if width < 5 || height < 5 {
+        return;
+    }
+
+    // Find depth range of visible pixels for normalization
+    let (min_depth, max_depth) = buffer.depth
+        .par_iter()
+        .filter(|&&d| d > f32::NEG_INFINITY)
+        .fold(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(min_d, max_d), &d| (min_d.min(d), max_d.max(d)),
+        )
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(a_min, a_max), (b_min, b_max)| (a_min.min(b_min), a_max.max(b_max)),
+        );
+
+    let depth_range = (max_depth - min_depth).max(1.0);
+    // Scale sample radius based on image size (larger images need larger samples)
+    let sample_radius = (radius * (width.min(height) as f32 / 200.0).max(1.0)).max(2.0);
+    // Depth threshold for occlusion (relative to depth range)
+    let depth_threshold = depth_range * 0.01;
+
+    // Compute occlusion factors in parallel
+    let occlusion: Vec<f32> = (0..height)
+        .into_par_iter()
+        .flat_map(|y| {
+            let mut row = vec![0.0_f32; width];
+
+            for x in 0..width {
+                let idx = y * width + x;
+
+                // Skip background pixels
+                if buffer.colors[idx].3 == 0 {
+                    continue;
+                }
+
+                let center_depth = buffer.depth[idx];
+                if center_depth <= f32::NEG_INFINITY {
+                    continue;
+                }
+
+                // Sample surrounding depths using kernel
+                let mut occluded_count = 0;
+                let mut valid_samples = 0;
+
+                for &(kx, ky) in &SSAO_KERNEL {
+                    // Sample at multiple radii for better quality
+                    for scale in &[0.5_f32, 1.0, 1.5] {
+                        let sx = x as i32 + (kx * sample_radius * scale) as i32;
+                        let sy = y as i32 + (ky * sample_radius * scale) as i32;
+
+                        // Bounds check
+                        if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
+                            continue;
+                        }
+
+                        let s_idx = sy as usize * width + sx as usize;
+                        let sample_alpha = buffer.colors[s_idx].3;
+
+                        // Skip background samples
+                        if sample_alpha == 0 {
+                            continue;
+                        }
+
+                        let sample_depth = buffer.depth[s_idx];
+                        if sample_depth <= f32::NEG_INFINITY {
+                            continue;
+                        }
+
+                        valid_samples += 1;
+
+                        // If sample is significantly in front of center, center is occluded
+                        if sample_depth > center_depth + depth_threshold {
+                            // Weight by how much it occludes (closer occluders = stronger)
+                            let occlusion_strength = ((sample_depth - center_depth) / depth_range).min(1.0);
+                            if occlusion_strength > 0.02 {
+                                occluded_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Compute occlusion factor
+                if valid_samples > 0 {
+                    let occ_ratio = occluded_count as f32 / valid_samples as f32;
+                    // Apply smooth falloff
+                    row[x] = (occ_ratio * strength).min(0.5);
+                }
+            }
+
+            row
+        })
+        .collect();
+
+    // Apply occlusion darkening in linear space
+    buffer.colors
+        .par_iter_mut()
+        .zip(occlusion.par_iter())
+        .for_each(|(color, &occ)| {
+            if occ > 0.0 {
+                // Darken in linear space for physically correct result
+                let r_lin = srgb_to_linear(color.0);
+                let g_lin = srgb_to_linear(color.1);
+                let b_lin = srgb_to_linear(color.2);
+
+                let darken = 1.0 - occ;
+                *color = (
+                    linear_to_srgb(r_lin * darken),
+                    linear_to_srgb(g_lin * darken),
+                    linear_to_srgb(b_lin * darken),
+                    color.3,
+                );
+            }
+        });
+}
+
+/// ACES Filmic Tone Mapping curve
+/// Attempt to simulate the Academy Color Encoding System response
+#[inline]
+fn aces_tonemap(x: f32) -> f32 {
+    // Simplified ACES approximation (Krzysztof Narkowicz)
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+}
+
+/// Apply ACES filmic tone mapping to the buffer for professional color reproduction.
+/// This maps HDR linear values to a pleasing display range with proper highlight rolloff.
+/// Uses parallel processing for performance.
+pub fn apply_tone_mapping(buffer: &mut PixelBuffer, exposure: f32) {
+    buffer.colors
+        .par_iter_mut()
+        .for_each(|color| {
+            if color.3 == 0 {
+                return;
+            }
+
+            // Convert to linear space
+            let r_lin = srgb_to_linear(color.0) * exposure;
+            let g_lin = srgb_to_linear(color.1) * exposure;
+            let b_lin = srgb_to_linear(color.2) * exposure;
+
+            // Apply ACES tone mapping
+            let r_tm = aces_tonemap(r_lin);
+            let g_tm = aces_tonemap(g_lin);
+            let b_tm = aces_tonemap(b_lin);
+
+            // Convert back to sRGB
+            *color = (
+                linear_to_srgb(r_tm),
+                linear_to_srgb(g_tm),
+                linear_to_srgb(b_tm),
+                color.3,
+            );
         });
 }

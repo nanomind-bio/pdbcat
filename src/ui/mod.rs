@@ -5,7 +5,7 @@
 mod output;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
-use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges};
+use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, downsample_2x, apply_silhouette_edges, apply_ssao, apply_tone_mapping};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -1159,9 +1159,14 @@ fn run_loop(
 
         app.render_molecule(&mut buffer, ssaa_pixels_per_cell);
 
-        // Apply silhouette edges when shading is enabled (ChimeraX-style outlines)
+        // Apply post-processing effects when shading is enabled
         if app.shading_enabled {
+            // SSAO for enhanced depth perception (soft shadows in crevices)
+            apply_ssao(&mut buffer, 4.0, 0.6);
+            // Silhouette edges (ChimeraX-style outlines)
             apply_silhouette_edges(&mut buffer, 0.15, 0.5);
+            // ACES tone mapping for professional color reproduction
+            apply_tone_mapping(&mut buffer, 1.1);
         }
         let t2 = Instant::now();
 
