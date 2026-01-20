@@ -617,9 +617,6 @@ impl App {
                 Representation::Backbone => {
                     self.render_backbone(buffer, projected, scale, z_min, z_max);
                 }
-                Representation::BallAndStick => {
-                    self.render_ball_and_stick(buffer, projected, scale, z_min, z_max);
-                }
                 Representation::Cartoon => {
                     self.render_cartoon(buffer, projected, scale, z_min, z_max);
                 }
@@ -701,120 +698,6 @@ impl App {
 
                 prev = Some((atom.chain_id, atom.residue_seq, info.x, info.y, info.z, color));
             }
-        }
-    }
-
-    fn render_ball_and_stick(
-        &self,
-        buffer: &mut PixelBuffer,
-        projected: &[(usize, ProjInfo)],
-        scale: f32,
-        z_min: f32,
-        z_max: f32,
-    ) {
-        use crate::render::braille::depth_cue;
-
-        // PyMOL-style ball-and-stick: small spheres at atom positions with thin bond cylinders
-        // Balls should be ~25% of VdW radius, sticks should be thin but visible
-        let ball_scale = 0.25; // 25% of VdW radius for small, visible spheres
-        let stick_radius_base = 1.8; // Fixed thin stick radius in pixels
-
-        // Build projection map with computed ball radii
-        let mut proj_map: Vec<Option<(ProjInfo, f32)>> = vec![None; self.molecule.atoms.len()];
-        for (idx, info) in projected {
-            let atom = &self.molecule.atoms[*idx];
-            // Use VdW radius scaled down for ball size
-            let ball_radius = atom.vdw_radius() * scale * ball_scale * info.size_scale / self.camera.zoom;
-            proj_map[*idx] = Some((*info, ball_radius));
-        }
-
-        // Collect all primitives - bonds first, then atoms on top
-        let mut primitives: Vec<Primitive> = Vec::with_capacity(self.molecule.bonds.len() * 2 + projected.len());
-
-        // Collect bond primitives (two-color: each half colored by its atom)
-        let mut bond_prims: Vec<(f32, Primitive)> = Vec::with_capacity(self.molecule.bonds.len() * 2);
-        for bond in &self.molecule.bonds {
-            if let (Some((p1, r1)), Some((p2, r2))) = (proj_map[bond.atom1], proj_map[bond.atom2]) {
-                // Direction from atom1 to atom2 in screen space
-                let dx = p2.x - p1.x;
-                let dy = p2.y - p1.y;
-                let dz = p2.z - p1.z;
-                let len = (dx * dx + dy * dy + dz * dz).sqrt();
-                if len < 0.1 {
-                    continue; // Skip zero-length bonds
-                }
-                let inv_len = 1.0 / len;
-                let nx = dx * inv_len;
-                let ny = dy * inv_len;
-                let nz = dz * inv_len;
-
-                // Trim bonds to start/end at sphere surfaces (not centers)
-                let trim1 = r1 * 0.8; // Start slightly inside sphere
-                let trim2 = r2 * 0.8;
-
-                // Bond endpoints trimmed to sphere surfaces
-                let x1 = p1.x + nx * trim1;
-                let y1 = p1.y + ny * trim1;
-                let z1 = p1.z + nz * trim1;
-                let x2 = p2.x - nx * trim2;
-                let y2 = p2.y - ny * trim2;
-                let z2 = p2.z - nz * trim2;
-
-                // Midpoint for two-color bond
-                let mx = (x1 + x2) * 0.5;
-                let my = (y1 + y2) * 0.5;
-                let mz = (z1 + z2) * 0.5;
-
-                // Stick radius: thin but visible, scales slightly with zoom
-                let stick_radius = (stick_radius_base * scale * p1.size_scale / self.camera.zoom).clamp(1.5, 4.0);
-
-                // Colors for each half
-                let color1 = if self.shading_enabled {
-                    depth_cue(p1.color, (z1 + mz) * 0.5, z_max, z_min)
-                } else {
-                    p1.color
-                };
-                let color2 = if self.shading_enabled {
-                    depth_cue(p2.color, (mz + z2) * 0.5, z_max, z_min)
-                } else {
-                    p2.color
-                };
-
-                // First half (atom1 color)
-                bond_prims.push(((z1 + mz) * 0.5, Primitive::cylinder(x1, y1, z1, mx, my, mz, stick_radius, color1)));
-                // Second half (atom2 color)
-                bond_prims.push(((mz + z2) * 0.5, Primitive::cylinder(mx, my, mz, x2, y2, z2, stick_radius, color2)));
-            }
-        }
-
-        // Sort bonds back to front, add to primitives FIRST (drawn first, behind atoms)
-        bond_prims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (_, prim) in bond_prims {
-            primitives.push(prim);
-        }
-
-        // Collect atom primitives sorted back to front - DRAW AFTER bonds (on top)
-        let mut sorted: Vec<_> = projected.iter().collect();
-        sorted.sort_by(|a, b| b.1.z.partial_cmp(&a.1.z).unwrap_or(std::cmp::Ordering::Equal));
-
-        for (idx, info) in sorted {
-            let atom = &self.molecule.atoms[*idx];
-            let radius = atom.vdw_radius() * scale * ball_scale * info.size_scale / self.camera.zoom;
-            let color = if self.shading_enabled {
-                depth_cue(info.color, info.z, z_max, z_min)
-            } else {
-                info.color
-            };
-            // Atoms drawn on top of bonds
-            primitives.push(Primitive::sphere(info.x, info.y, info.z, radius.clamp(3.0, 20.0), color));
-        }
-
-        if primitives.len() < TILE_THRESHOLD || !self.shading_enabled {
-            for prim in &primitives {
-                prim.draw_offset(buffer, 0, 0);
-            }
-        } else {
-            render_primitives_tiled(buffer, &primitives);
         }
     }
 
@@ -1466,7 +1349,7 @@ pub fn run_benchmark(path: &Path, molecule: Molecule) -> Result<(), UiError> {
     app.shading_enabled = true;
     app.auto_spin = true;
     app.show_hud = false;
-    app.representation = crate::render::Representation::BallAndStick;
+    app.representation = crate::render::Representation::Cartoon;
 
     // Fixed resolution for reproducible benchmarks (simulates 160x48 terminal with 2x4 pixels/cell)
     let mol_width: u16 = 160;

@@ -38,7 +38,7 @@ jobs:
 
     - name: Test all representations
       run: |
-        for repr in cartoon ball-and-stick surface backbone; do
+        for repr in cartoon surface backbone; do
           echo "Testing --repr $repr"
           ./target/release/pdbcat examples/1UBQ.pdb -o /tmp/test_${repr}.png --repr $repr
           test -f /tmp/test_${repr}.png

@@ -19,8 +19,6 @@ pub use surface::{generate_surface, Triangle, SurfaceAtom};
 pub enum Representation {
     /// Backbone trace (Cα for proteins, P for nucleic acids)
     Backbone,
-    /// Ball-and-stick (atoms as spheres, bonds as cylinders)
-    BallAndStick,
     /// Cartoon/ribbon (secondary structure visualization)
     #[default]
     Cartoon,
@@ -32,8 +30,7 @@ impl Representation {
     /// Cycle to the next representation
     pub fn next(self) -> Self {
         match self {
-            Representation::Backbone => Representation::BallAndStick,
-            Representation::BallAndStick => Representation::Cartoon,
+            Representation::Backbone => Representation::Cartoon,
             Representation::Cartoon => Representation::Surface,
             Representation::Surface => Representation::Backbone,
         }
@@ -43,7 +40,6 @@ impl Representation {
     pub fn name(&self) -> &'static str {
         match self {
             Representation::Backbone => "Backbone",
-            Representation::BallAndStick => "Ball-and-Stick",
             Representation::Cartoon => "Cartoon",
             Representation::Surface => "Surface",
         }

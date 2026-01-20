@@ -38,7 +38,7 @@ struct Args {
     #[arg(long, short = 'r')]
     resolution: Option<String>,
 
-    /// Representation mode (cartoon, ball-and-stick, surface, backbone)
+    /// Representation mode (cartoon, surface, backbone)
     #[arg(long, default_value = "cartoon")]
     repr: String,
 
@@ -99,11 +99,10 @@ fn main() -> ExitCode {
     // Parse representation
     let repr = match args.repr.to_lowercase().as_str() {
         "cartoon" => render::Representation::Cartoon,
-        "ball-and-stick" | "ballandstick" | "bas" => render::Representation::BallAndStick,
         "surface" => render::Representation::Surface,
         "backbone" => render::Representation::Backbone,
         _ => {
-            eprintln!("Error: Unknown representation '{}'. Use: cartoon, ball-and-stick, surface, backbone", args.repr);
+            eprintln!("Error: Unknown representation '{}'. Use: cartoon, surface, backbone", args.repr);
             return ExitCode::from(1);
         }
     };
