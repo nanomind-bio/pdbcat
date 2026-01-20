@@ -39,46 +39,63 @@ jobs:
         mkdir -p assets
         PDB=examples/1UBQ.pdb
 
-        # Function to create terminal-style image with command header
+        # Function to create terminal-style image with command header (high-res smooth)
         make_terminal_image() {
           local cmd="$1"
           local raw_img="$2"
           local output="$3"
           local width=$(identify -format "%w" "$raw_img")
-          local height=$(identify -format "%h" "$raw_img")
           local header_height=40
 
-          # Create header with command text
-          convert -size ${width}x${header_height} xc:'#1e1e1e' \
-            -font DejaVu-Sans-Mono -pointsize 16 -fill '#00ff00' \
+          convert -size ${width}x${header_height} xc:'#1a1a1a' \
+            -font DejaVu-Sans-Mono -pointsize 16 -fill '#cccccc' \
             -gravity West -annotate +10+0 '$ '"$cmd" \
             "$raw_img" -append "$output"
         }
 
-        # Generate raw images first
+        # Function to create pixelated terminal-style image (half-block look)
+        make_pixelated_image() {
+          local cmd="$1"
+          local raw_img="$2"
+          local output="$3"
+          local scale="$4"
+
+          # Scale up with nearest-neighbor to preserve pixels
+          convert "$raw_img" -filter point -resize ${scale}% /tmp/scaled.png
+          local width=$(identify -format "%w" /tmp/scaled.png)
+          local header_height=36
+
+          convert -size ${width}x${header_height} xc:'#1a1a1a' \
+            -font DejaVu-Sans-Mono -pointsize 18 -fill '#cccccc' \
+            -gravity West -annotate +12+0 '$ '"$cmd" \
+            /tmp/scaled.png -append "$output"
+        }
+
+        # Hero image - pixelated half-block style to show it's a TUI
+        ./target/release/pdbcat $PDB -o /tmp/raw-demo.png -r 120x72 --repr cartoon --bg black
+        make_pixelated_image "pdbcat 1ubq.pdb" /tmp/raw-demo.png assets/demo.png 600
+
+        # Representation examples (high-res smooth for detail)
         ./target/release/pdbcat $PDB -o /tmp/raw-cartoon.png -r 400x300 --repr cartoon --bg black
         ./target/release/pdbcat $PDB -o /tmp/raw-surface.png -r 400x300 --repr surface --bg black
         ./target/release/pdbcat $PDB -o /tmp/raw-backbone.png -r 400x300 --repr backbone --bg black
 
-        # Color schemes
-        ./target/release/pdbcat $PDB -o /tmp/raw-chain.png -r 400x300 --repr cartoon -c chain --bg black
-        ./target/release/pdbcat $PDB -o /tmp/raw-rainbow.png -r 400x300 --repr cartoon -c rainbow --bg black
-        ./target/release/pdbcat $PDB -o /tmp/raw-secondary.png -r 400x300 --repr cartoon -c secondary --bg black
-
-        # Half-block (low res to simulate terminal)
-        ./target/release/pdbcat $PDB -o /tmp/raw-half.png -r 160x96 --repr cartoon --bg black
-
-        # Create terminal-style images with command headers
-        make_terminal_image "pdbcat 1ubq.pdb" /tmp/raw-cartoon.png assets/demo.png
         make_terminal_image "pdbcat 1ubq.pdb --repr cartoon" /tmp/raw-cartoon.png assets/cartoon.png
         make_terminal_image "pdbcat 1ubq.pdb --repr surface" /tmp/raw-surface.png assets/surface.png
         make_terminal_image "pdbcat 1ubq.pdb --repr backbone" /tmp/raw-backbone.png assets/backbone.png
+
+        # Color scheme examples
+        ./target/release/pdbcat $PDB -o /tmp/raw-chain.png -r 400x300 --repr cartoon -c chain --bg black
+        ./target/release/pdbcat $PDB -o /tmp/raw-rainbow.png -r 400x300 --repr cartoon -c rainbow --bg black
+        ./target/release/pdbcat $PDB -o /tmp/raw-secondary.png -r 400x300 --repr cartoon -c secondary --bg black
 
         make_terminal_image "pdbcat 1ubq.pdb -c chain" /tmp/raw-chain.png assets/color-chain.png
         make_terminal_image "pdbcat 1ubq.pdb -c rainbow" /tmp/raw-rainbow.png assets/color-rainbow.png
         make_terminal_image "pdbcat 1ubq.pdb -c secondary" /tmp/raw-secondary.png assets/color-secondary.png
 
-        make_terminal_image "pdbcat 1ubq.pdb --backend half" /tmp/raw-half.png assets/half-block.png
+        # Half-block example - pixelated style
+        ./target/release/pdbcat $PDB -o /tmp/raw-half.png -r 100x60 --repr cartoon --bg black
+        make_pixelated_image "pdbcat 1ubq.pdb --backend half" /tmp/raw-half.png assets/half-block.png 400
 
         ls -la assets/
 
