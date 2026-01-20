@@ -148,6 +148,44 @@ impl Camera {
         }
     }
 
+    /// Transform a point from world space to camera space
+    /// Used for surface mesh rendering
+    pub fn transform_point(&self, point: &Vector3<f32>) -> Vector3<f32> {
+        // Translate to center of rotation, then rotate
+        let centered = point - self.center;
+        self.rotation * centered
+    }
+
+    /// Transform a normal vector (rotation only, no translation)
+    /// Used for surface mesh rendering
+    pub fn transform_normal(&self, normal: &Vector3<f32>) -> Vector3<f32> {
+        self.rotation * normal
+    }
+
+    /// Project a camera-space point to screen coordinates
+    /// Returns (x, y, z) where z is depth for depth testing
+    pub fn project_point(&self, point: &Vector3<f32>, center_x: f32, center_y: f32, scale: f32) -> (f32, f32, f32) {
+        // Apply zoom
+        let scaled = point * self.zoom;
+
+        match self.projection {
+            ProjectionMode::Orthographic => {
+                let screen_x = center_x + scaled.x * scale + self.translation.x;
+                let screen_y = center_y - scaled.y * scale + self.translation.y; // Y flipped for screen coords
+                (screen_x, screen_y, scaled.z)
+            }
+            ProjectionMode::Perspective => {
+                let view_distance = scale * 2.0;
+                let z_from_camera = (view_distance - scaled.z).max(0.1);
+                let perspective_factor = view_distance / z_from_camera;
+
+                let screen_x = center_x + scaled.x * scale * perspective_factor + self.translation.x;
+                let screen_y = center_y - scaled.y * scale * perspective_factor + self.translation.y;
+                (screen_x, screen_y, scaled.z)
+            }
+        }
+    }
+
     /// Fit the view to show the entire molecule
     pub fn fit_to_bounds(&mut self, min: Vector3<f32>, max: Vector3<f32>, screen_size: (u16, u16)) {
         // Calculate molecule size

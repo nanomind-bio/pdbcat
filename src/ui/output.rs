@@ -7,127 +7,52 @@ use std::env;
 use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageProtocol {
-    Kitty,
-    ITerm2,
-    Sixel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackend {
     HalfBlock,
-    Image(ImageProtocol),
+    ITerm2,
 }
 
 impl RenderBackend {
     pub fn label(self) -> &'static str {
         match self {
             RenderBackend::HalfBlock => "Half-Block",
-            RenderBackend::Image(ImageProtocol::Kitty) => "Kitty",
-            RenderBackend::Image(ImageProtocol::ITerm2) => "iTerm2",
-            RenderBackend::Image(ImageProtocol::Sixel) => "Sixel",
+            RenderBackend::ITerm2 => "iTerm2",
         }
+    }
+
+    /// Check if this backend supports inline images
+    pub fn supports_images(self) -> bool {
+        matches!(self, RenderBackend::ITerm2)
     }
 }
 
 pub fn detect_backend() -> RenderBackend {
     if let Ok(value) = env::var("PDBCAT_IMAGE") {
         match value.to_lowercase().as_str() {
-            "kitty" => return RenderBackend::Image(ImageProtocol::Kitty),
-            "iterm2" | "iterm" => return RenderBackend::Image(ImageProtocol::ITerm2),
-            "sixel" => return RenderBackend::Image(ImageProtocol::Sixel),
+            "iterm2" | "iterm" => return RenderBackend::ITerm2,
             "half" | "half-block" | "none" => return RenderBackend::HalfBlock,
             _ => {}
         }
     }
 
-    let term = env::var("TERM").unwrap_or_default().to_lowercase();
     let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     let lc_terminal = env::var("LC_TERMINAL").unwrap_or_default().to_lowercase();
 
-    if env::var("KITTY_WINDOW_ID").is_ok() || term.contains("kitty") {
-        return RenderBackend::Image(ImageProtocol::Kitty);
-    }
-
     if has_iterm_env(&term_program, &lc_terminal) {
-        return RenderBackend::Image(ImageProtocol::ITerm2);
-    }
-
-    if term.contains("sixel") || term.contains("mlterm") {
-        return RenderBackend::Image(ImageProtocol::Sixel);
+        return RenderBackend::ITerm2;
     }
 
     RenderBackend::HalfBlock
 }
 
-pub fn render_image(
-    protocol: ImageProtocol,
+pub fn render_iterm2_image(
     buffer: &PixelBuffer,
     cell_width: u16,
     cell_height: u16,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let data = match protocol {
-        ImageProtocol::Kitty => render_kitty_sequence(buffer, cell_width, cell_height),
-        ImageProtocol::ITerm2 => render_iterm2_sequence(buffer, cell_width, cell_height),
-        ImageProtocol::Sixel => render_sixel_sequence(buffer),
-    };
+    let data = render_iterm2_sequence(buffer, cell_width, cell_height);
     write_sequence(out, &data)
-}
-
-fn render_kitty_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u16) -> Vec<u8> {
-    // Use RGB (f=24) instead of RGBA (f=32) - 25% less data
-    let raw_data = rgb_bytes(buffer);
-
-    // Use zlib compression to reduce payload size by 3-10x (critical for terminal throughput)
-    // o=z flag tells Kitty the payload is zlib-compressed
-    let compressed = zlib_compress(&raw_data);
-    let payload = base64_encode(&compressed);
-
-    // Kitty protocol requires chunking large payloads to avoid terminal buffer issues
-    // Maximum chunk size is 4096 bytes as per spec
-    const CHUNK_SIZE: usize = 4096;
-
-    let mut seq = Vec::new();
-    seq.extend_from_slice(b"\x1b[H");
-
-    let payload_bytes = payload.as_bytes();
-    let mut offset = 0;
-    let total_len = payload_bytes.len();
-
-    while offset < total_len {
-        let chunk_end = (offset + CHUNK_SIZE).min(total_len);
-        let chunk = &payload_bytes[offset..chunk_end];
-        let is_last = chunk_end >= total_len;
-
-        if offset == 0 {
-            // First chunk includes image metadata
-            // f=24 = RGB (no alpha), o=z = zlib-compressed
-            seq.extend_from_slice(
-                format!(
-                    "\x1b_Gf=24,o=z,s={},v={},c={},r={},a=T,i=1,m={};",
-                    buffer.width(),
-                    buffer.height(),
-                    cell_width,
-                    cell_height,
-                    if is_last { 0 } else { 1 }
-                )
-                .as_bytes(),
-            );
-        } else {
-            // Continuation chunks only need m flag
-            seq.extend_from_slice(
-                format!("\x1b_Gm={};", if is_last { 0 } else { 1 }).as_bytes(),
-            );
-        }
-
-        seq.extend_from_slice(chunk);
-        seq.extend_from_slice(b"\x1b\\");
-
-        offset = chunk_end;
-    }
-
-    seq
 }
 
 fn render_iterm2_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u16) -> Vec<u8> {
@@ -153,176 +78,7 @@ fn render_iterm2_sequence(buffer: &PixelBuffer, cell_width: u16, cell_height: u1
     seq
 }
 
-fn render_sixel_sequence(buffer: &PixelBuffer) -> Vec<u8> {
-    let width = buffer.width();
-    let height = buffer.height();
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-
-    let mut indices: Vec<u16> = Vec::with_capacity(width * height);
-    let mut used = vec![false; 217];
-
-    for y in 0..height {
-        for x in 0..width {
-            let (r, g, b, a) = buffer.get_pixel(x, y);
-            let idx = if a == 0 {
-                0
-            } else {
-                sixel_index(r, g, b)
-            };
-            indices.push(idx);
-            if idx > 0 {
-                used[idx as usize] = true;
-            }
-        }
-    }
-
-    let mut seq: Vec<u8> = Vec::new();
-    seq.extend_from_slice(b"\x1b[H");
-    // Start sixel with raster attributes: "Pan;Pad;Ph;Pv where:
-    // Pan/Pad = pixel aspect ratio (1:1), Ph = width, Pv = height
-    // This tells the terminal the intended image dimensions
-    seq.extend_from_slice(format!("\x1bPq\"1;1;{};{}", width, height).as_bytes());
-    seq.extend_from_slice(b"#0;2;0;0;0");
-
-    for idx in 1..=216 {
-        if used[idx] {
-            let (r, g, b) = sixel_color(idx as u16);
-            seq.extend_from_slice(format!("#{};2;{};{};{}", idx, r, g, b).as_bytes());
-        }
-    }
-
-    let bands = (height + 5) / 6;
-    for band in 0..bands {
-        let band_start = band * 6;
-        let band_end = (band_start + 6).min(height);
-        let mut band_used = vec![false; 217];
-        let mut band_colors: Vec<u16> = Vec::new();
-
-        for y in band_start..band_end {
-            for x in 0..width {
-                let idx = indices[y * width + x];
-                if idx > 0 && !band_used[idx as usize] {
-                    band_used[idx as usize] = true;
-                    band_colors.push(idx);
-                }
-            }
-        }
-
-        if band_colors.is_empty() {
-            if band + 1 < bands {
-                seq.push(b'-');
-            }
-            continue;
-        }
-
-        for (c_idx, color) in band_colors.iter().enumerate() {
-            seq.extend_from_slice(format!("#{}", color).as_bytes());
-            for x in 0..width {
-                let mut bits: u8 = 0;
-                for bit in 0..6 {
-                    let y = band_start + bit;
-                    if y < height && indices[y * width + x] == *color {
-                        bits |= 1 << bit;
-                    }
-                }
-                seq.push(63 + bits);
-            }
-            if c_idx + 1 < band_colors.len() {
-                seq.push(b'$');
-            }
-        }
-
-        if band + 1 < bands {
-            seq.push(b'-');
-        }
-    }
-
-    seq.extend_from_slice(b"\x1b\\");
-    seq
-}
-
-fn rgba_bytes(buffer: &PixelBuffer) -> Vec<u8> {
-    let mut data = Vec::with_capacity(buffer.width() * buffer.height() * 4);
-    for y in 0..buffer.height() {
-        for x in 0..buffer.width() {
-            let (r, g, b, a) = buffer.get_pixel(x, y);
-            data.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-    data
-}
-
-/// RGB bytes (no alpha) - 25% smaller than RGBA
-fn rgb_bytes(buffer: &PixelBuffer) -> Vec<u8> {
-    let mut data = Vec::with_capacity(buffer.width() * buffer.height() * 3);
-    for y in 0..buffer.height() {
-        for x in 0..buffer.width() {
-            let (r, g, b, _) = buffer.get_pixel(x, y);
-            data.extend_from_slice(&[r, g, b]);
-        }
-    }
-    data
-}
-
-fn sixel_index(r: u8, g: u8, b: u8) -> u16 {
-    let r6 = (r as u16 * 5 + 127) / 255;
-    let g6 = (g as u16 * 5 + 127) / 255;
-    let b6 = (b as u16 * 5 + 127) / 255;
-    1 + r6 * 36 + g6 * 6 + b6
-}
-
-fn sixel_color(idx: u16) -> (u8, u8, u8) {
-    let idx = idx.saturating_sub(1);
-    let r = idx / 36;
-    let g = (idx / 6) % 6;
-    let b = idx % 6;
-    (
-        (r * 20) as u8,
-        (g * 20) as u8,
-        (b * 20) as u8,
-    )
-}
-
-fn encode_png(buffer: &PixelBuffer) -> Vec<u8> {
-    encode_png_rgba(buffer)
-}
-
-/// Encode as RGBA PNG (4 bytes per pixel)
-fn encode_png_rgba(buffer: &PixelBuffer) -> Vec<u8> {
-    let width = buffer.width() as u32;
-    let height = buffer.height() as u32;
-    let mut raw = Vec::with_capacity((buffer.width() * buffer.height() * 4) + buffer.height());
-
-    for y in 0..buffer.height() {
-        raw.push(0); // filter byte
-        for x in 0..buffer.width() {
-            let (r, g, b, a) = buffer.get_pixel(x, y);
-            raw.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-
-    let compressed = zlib_compress(&raw);
-    let mut png = Vec::new();
-    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.push(8); // bit depth
-    ihdr.push(6); // color type RGBA
-    ihdr.push(0); // compression
-    ihdr.push(0); // filter
-    ihdr.push(0); // interlace
-    write_chunk(&mut png, b"IHDR", &ihdr);
-    write_chunk(&mut png, b"IDAT", &compressed);
-    write_chunk(&mut png, b"IEND", &[]);
-
-    png
-}
-
-/// Encode as RGB PNG (3 bytes per pixel) - 25% smaller than RGBA
+/// Encode as RGB PNG (3 bytes per pixel)
 pub fn encode_png_rgb(buffer: &PixelBuffer) -> Vec<u8> {
     let width = buffer.width() as u32;
     let height = buffer.height() as u32;

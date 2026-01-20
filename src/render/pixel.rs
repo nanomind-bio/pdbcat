@@ -1049,6 +1049,127 @@ impl PixelBuffer {
             }
         }
     }
+
+    /// Draw a filled triangle with smooth shading using interpolated normals
+    /// Uses barycentric coordinates for interpolation
+    pub fn draw_triangle_shaded(
+        &mut self,
+        // Vertex positions (screen space)
+        x0: f32, y0: f32, z0: f32,
+        x1: f32, y1: f32, z1: f32,
+        x2: f32, y2: f32, z2: f32,
+        // Vertex normals (for lighting)
+        nx0: f32, ny0: f32, nz0: f32,
+        nx1: f32, ny1: f32, nz1: f32,
+        nx2: f32, ny2: f32, nz2: f32,
+        // Base color
+        color: (u8, u8, u8),
+    ) {
+        // 3-light rig matching sphere/cylinder shading
+        const KEY_DIR: (f32, f32, f32) = (0.408, -0.511, 0.776);
+        const KEY_HALF: (f32, f32, f32) = (0.216, -0.270, 0.938);
+        const FILL_DIR: (f32, f32, f32) = (-0.5, 0.3, 0.81);
+        const RIM_DIR: (f32, f32, f32) = (0.0, 0.2, -0.98);
+
+        // Bounding box
+        let min_x = x0.min(x1).min(x2).floor() as i32;
+        let max_x = x0.max(x1).max(x2).ceil() as i32;
+        let min_y = y0.min(y1).min(y2).floor() as i32;
+        let max_y = y0.max(y1).max(y2).ceil() as i32;
+
+        let width = self.width as i32;
+        let height = self.height as i32;
+
+        // Clamp to screen bounds
+        let min_x = min_x.max(0);
+        let max_x = max_x.min(width - 1);
+        let min_y = min_y.max(0);
+        let max_y = max_y.min(height - 1);
+
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        // Edge function denominator (2x signed area of triangle)
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if area.abs() < 0.001 {
+            return; // Degenerate triangle
+        }
+        let inv_area = 1.0 / area;
+
+        let br = color.0 as f32 / 255.0;
+        let bg = color.1 as f32 / 255.0;
+        let bb = color.2 as f32 / 255.0;
+
+        // Rasterize using edge functions
+        for py in min_y..=max_y {
+            let fy = py as f32 + 0.5;
+            for px in min_x..=max_x {
+                let fx = px as f32 + 0.5;
+
+                // Compute barycentric coordinates
+                let w0 = ((x1 - fx) * (y2 - fy) - (x2 - fx) * (y1 - fy)) * inv_area;
+                let w1 = ((x2 - fx) * (y0 - fy) - (x0 - fx) * (y2 - fy)) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+
+                // Check if point is inside triangle
+                if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 {
+                    continue;
+                }
+
+                // Interpolate z
+                let z = w0 * z0 + w1 * z1 + w2 * z2;
+
+                // Depth test
+                let idx = py as usize * self.width + px as usize;
+                if z <= self.depth[idx] {
+                    continue;
+                }
+
+                // Interpolate normal
+                let nx = w0 * nx0 + w1 * nx1 + w2 * nx2;
+                let ny = w0 * ny0 + w1 * ny1 + w2 * ny2;
+                let nz = w0 * nz0 + w1 * nz1 + w2 * nz2;
+
+                // Normalize
+                let len = (nx * nx + ny * ny + nz * nz).sqrt();
+                let (nx, ny, nz) = if len > 0.001 {
+                    (nx / len, ny / len, nz / len)
+                } else {
+                    (0.0, 0.0, 1.0)
+                };
+
+                // Key light diffuse
+                let key_dot = (nx * KEY_DIR.0 + ny * KEY_DIR.1 + nz * KEY_DIR.2).max(0.0);
+                let key_diffuse = 0.65 * key_dot;
+
+                // Key specular (Blinn-Phong)
+                let n_dot_h = (nx * KEY_HALF.0 + ny * KEY_HALF.1 + nz * KEY_HALF.2).max(0.0);
+                let spec_pow = n_dot_h.powi(32);
+                let spec = if key_dot > 0.0 { 0.3 * spec_pow } else { 0.0 };
+
+                // Fill light
+                let fill_dot = (nx * FILL_DIR.0 + ny * FILL_DIR.1 + nz * FILL_DIR.2).max(0.0);
+                let fill_diffuse = 0.25 * fill_dot;
+
+                // Rim light
+                let rim_dot = (nx * RIM_DIR.0 + ny * RIM_DIR.1 + nz * RIM_DIR.2).max(0.0);
+                let fresnel = (1.0 - nz.abs()).max(0.0);
+                let rim = 0.2 * rim_dot * fresnel * fresnel;
+
+                // Ambient
+                let ambient = 0.15;
+                let shade = ambient + key_diffuse + fill_diffuse + rim;
+
+                let r = ((br * shade + spec).min(1.0) * 255.0) as u8;
+                let g = ((bg * shade + spec).min(1.0) * 255.0) as u8;
+                let b = ((bb * shade + spec).min(1.0) * 255.0) as u8;
+
+                self.colors[idx] = (r, g, b, 255);
+                self.depth[idx] = z;
+            }
+        }
+    }
 }
 
 /// Blend a color towards darker for anti-aliasing coverage
@@ -1460,4 +1581,73 @@ pub fn apply_tone_mapping(buffer: &mut PixelBuffer, exposure: f32) {
                 color.3,
             );
         });
+}
+
+/// Fill small gaps in the depth buffer caused by concave regions in Surface rendering.
+/// This fixes "ray" artifacts where spheres don't fully overlap in surface representation.
+/// Only fills pixels where neighboring opaque pixels have similar depth (within depth_eps).
+pub fn fill_depth_gaps(buffer: &mut PixelBuffer, radius: usize, depth_eps: f32) {
+    let width = buffer.width;
+    let height = buffer.height;
+
+    if width < radius * 2 + 1 || height < radius * 2 + 1 {
+        return;
+    }
+
+    let colors = buffer.colors.clone();
+    let depth = buffer.depth.clone();
+    let mut out_colors = buffer.colors.clone();
+    let mut out_depth = buffer.depth.clone();
+
+    for y in radius..height - radius {
+        for x in radius..width - radius {
+            let idx = y * width + x;
+            // Only process transparent/empty pixels
+            if colors[idx].3 != 0 {
+                continue;
+            }
+
+            let mut best: Option<(f32, (u8, u8, u8, u8))> = None;
+            let mut min_d = f32::INFINITY;
+            let mut max_d = f32::NEG_INFINITY;
+
+            // Search neighbors within radius
+            for dy in -(radius as i32)..=(radius as i32) {
+                for dx in -(radius as i32)..=(radius as i32) {
+                    let nx = (x as i32 + dx) as usize;
+                    let ny = (y as i32 + dy) as usize;
+                    let n_idx = ny * width + nx;
+
+                    // Skip empty neighbors
+                    if colors[n_idx].3 == 0 {
+                        continue;
+                    }
+
+                    let d = depth[n_idx];
+                    // Track depth range
+                    min_d = min_d.min(d);
+                    max_d = max_d.max(d);
+
+                    // Keep track of the closest (highest z) neighbor
+                    if best.map_or(true, |(bd, _)| d > bd) {
+                        best = Some((d, colors[n_idx]));
+                    }
+                }
+            }
+
+            // Only fill if we found neighbors and their depth range is within tolerance
+            // This ensures we only fill gaps between surfaces at similar depth,
+            // not gaps between front and back surfaces
+            if let Some((d, c)) = best {
+                if max_d - min_d <= depth_eps {
+                    out_colors[idx] = c;
+                    // Place filled pixel slightly behind to avoid z-fighting
+                    out_depth[idx] = d - 1e-3;
+                }
+            }
+        }
+    }
+
+    buffer.colors = out_colors;
+    buffer.depth = out_depth;
 }

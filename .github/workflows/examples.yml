@@ -1,0 +1,83 @@
+name: Generate Example Images
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - '.github/workflows/examples.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: examples
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  generate-examples:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-action@stable
+
+    - name: Build pdbcat
+      run: cargo build --release
+
+    - name: Generate example images
+      run: |
+        # Clean assets directory to ensure no stale files
+        rm -rf assets
+        mkdir -p assets
+        PDB=examples/1UBQ.pdb
+
+        # iTerm2-style images (high resolution, what inline images look like)
+        ./target/release/pdbcat $PDB -o assets/iterm2-cartoon.png -r 400x300 --repr cartoon --bg black
+        ./target/release/pdbcat $PDB -o assets/iterm2-bas.png -r 400x300 --repr ball-and-stick --bg black
+        ./target/release/pdbcat $PDB -o assets/iterm2-surface.png -r 400x300 --repr surface --bg black
+        ./target/release/pdbcat $PDB -o assets/iterm2-backbone.png -r 400x300 --repr backbone --bg black
+
+        # Half-block style images (low resolution, simulates terminal character output)
+        # 160x96 = 80 chars wide x 48 chars tall (each char is 1x2 pixels)
+        ./target/release/pdbcat $PDB -o assets/half-cartoon.png -r 160x96 --repr cartoon --bg black
+        ./target/release/pdbcat $PDB -o assets/half-bas.png -r 160x96 --repr ball-and-stick --bg black
+        ./target/release/pdbcat $PDB -o assets/half-surface.png -r 160x96 --repr surface --bg black
+        ./target/release/pdbcat $PDB -o assets/half-backbone.png -r 160x96 --repr backbone --bg black
+
+        # Color scheme examples (high res)
+        ./target/release/pdbcat $PDB -o assets/color-chain.png -r 400x300 --repr cartoon -c chain --bg black
+        ./target/release/pdbcat $PDB -o assets/color-rainbow.png -r 400x300 --repr cartoon -c rainbow --bg black
+        ./target/release/pdbcat $PDB -o assets/color-secondary.png -r 400x300 --repr cartoon -c secondary --bg black
+
+        ls -la assets/
+
+    - name: Commit and push images (amend to avoid history bloat)
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add assets/
+
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        # Check if the most recent commit is an images update (to amend it)
+        LAST_MSG=$(git log -1 --pretty=%s)
+        if [[ "$LAST_MSG" == "Update example images" || "$LAST_MSG" == "Add example images" ]]; then
+          echo "Amending previous images commit to avoid history bloat"
+          git commit --amend --no-edit
+          git push --force-with-lease
+        else
+          echo "Creating new images commit"
+          git commit -m "Update example images"
+          git push
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

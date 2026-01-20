@@ -46,6 +46,11 @@ impl Atom {
     pub fn vdw_radius(&self) -> f32 {
         self.element.vdw_radius()
     }
+
+    /// Get the covalent radius for this atom (for ball-and-stick)
+    pub fn covalent_radius(&self) -> f32 {
+        self.element.covalent_radius()
+    }
 }
 
 /// Chemical element with associated properties
@@ -118,6 +123,30 @@ impl Element {
             Element::I => 1.98,
             Element::Se => 1.90,
             Element::Unknown => 1.50, // Default radius
+        }
+    }
+
+    /// Get covalent radius in Ångströms (for ball-and-stick models)
+    pub fn covalent_radius(&self) -> f32 {
+        match self {
+            Element::H => 0.31,
+            Element::C => 0.76,
+            Element::N => 0.71,
+            Element::O => 0.66,
+            Element::S => 1.05,
+            Element::P => 1.07,
+            Element::Fe => 1.32,
+            Element::Zn => 1.22,
+            Element::Ca => 1.76,
+            Element::Mg => 1.41,
+            Element::Na => 1.66,
+            Element::K => 2.03,
+            Element::Cl => 1.02,
+            Element::F => 0.57,
+            Element::Br => 1.20,
+            Element::I => 1.39,
+            Element::Se => 1.20,
+            Element::Unknown => 0.80, // Default radius
         }
     }
 

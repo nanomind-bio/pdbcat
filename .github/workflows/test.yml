@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-action@stable
+
+    - name: Build
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test
+
+    - name: Test PDB parsing
+      run: |
+        ./target/release/pdbcat examples/1UBQ.pdb -o /tmp/test.png
+        test -f /tmp/test.png
+        echo "PDB rendering OK"
+
+    - name: Test mmCIF parsing
+      run: |
+        # Download a small CIF file for testing
+        curl -sL "https://files.rcsb.org/download/1UBQ.cif" -o /tmp/1ubq.cif
+        ./target/release/pdbcat /tmp/1ubq.cif -o /tmp/test_cif.png
+        test -f /tmp/test_cif.png
+        echo "mmCIF rendering OK"
+
+    - name: Test all representations
+      run: |
+        for repr in cartoon ball-and-stick surface backbone; do
+          echo "Testing --repr $repr"
+          ./target/release/pdbcat examples/1UBQ.pdb -o /tmp/test_${repr}.png --repr $repr
+          test -f /tmp/test_${repr}.png
+        done
+        echo "All representations OK"
+
+    - name: Test all color schemes
+      run: |
+        for color in chain rainbow secondary; do
+          echo "Testing -c $color"
+          ./target/release/pdbcat examples/1UBQ.pdb -o /tmp/test_${color}.png -c $color
+          test -f /tmp/test_${color}.png
+        done
+        echo "All color schemes OK"
