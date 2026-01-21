@@ -314,14 +314,14 @@ const fn const_ln(x: f32) -> f32 {
     let ln_m = u - u2/2.0 + u3/3.0 - u4/4.0 + u5/5.0;
 
     // ln(x) = ln(mantissa * 2^exp) = ln(mantissa) + exp * ln(2)
-    ln_m + (exp as f32) * 0.693147180559945
+    ln_m + (exp as f32) * std::f32::consts::LN_2
 }
 
 /// Const-compatible exp approximation
 const fn const_exp(x: f32) -> f32 {
     // exp(x) using Taylor series
     // Reduce range: exp(x) = exp(x - n*ln2) * 2^n
-    let ln2 = 0.693147180559945_f32;
+    let ln2 = std::f32::consts::LN_2;
     let n = (x / ln2) as i32;
     let r = x - (n as f32) * ln2;
 
@@ -833,12 +833,12 @@ impl PixelBuffer {
 
             // Anti-aliased neighbors (simplified coverage)
             if fx > 0.3 {
-                let blend = ((1.0 - fx) * 0.5) as f32;
+                let blend = (1.0 - fx) * 0.5;
                 let aa_color = blend_color(color, blend);
                 self.set_pixel(xi + 1, yi, z, aa_color);
             }
             if fy > 0.3 {
-                let blend = ((1.0 - fy) * 0.5) as f32;
+                let blend = (1.0 - fy) * 0.5;
                 let aa_color = blend_color(color, blend);
                 self.set_pixel(xi, yi + 1, z, aa_color);
             }
@@ -1629,7 +1629,7 @@ pub fn fill_depth_gaps(buffer: &mut PixelBuffer, radius: usize, depth_eps: f32) 
                     max_d = max_d.max(d);
 
                     // Keep track of the closest (highest z) neighbor
-                    if best.map_or(true, |(bd, _)| d > bd) {
+                    if best.is_none_or(|(bd, _)| d > bd) {
                         best = Some((d, colors[n_idx]));
                     }
                 }

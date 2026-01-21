@@ -2,25 +2,24 @@
 
 /// Type of secondary structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SecondaryStructure {
     /// Alpha helix, 3-10 helix, or pi helix
     Helix(HelixType),
     /// Beta sheet
     Sheet,
     /// Random coil or unstructured
+    #[default]
     Coil,
 }
 
-impl Default for SecondaryStructure {
-    fn default() -> Self {
-        SecondaryStructure::Coil
-    }
-}
 
 /// Types of helical secondary structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum HelixType {
     /// Right-handed alpha helix (most common)
+    #[default]
     Alpha,
     /// 3-10 helix
     ThreeTen,
@@ -28,11 +27,6 @@ pub enum HelixType {
     Pi,
 }
 
-impl Default for HelixType {
-    fn default() -> Self {
-        HelixType::Alpha
-    }
-}
 
 /// Assignment of secondary structure to a range of residues
 #[derive(Debug, Clone)]

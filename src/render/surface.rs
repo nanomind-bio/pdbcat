@@ -97,9 +97,9 @@ pub fn generate_surface(
     }
 
     // Run marching cubes at isovalue 0 (surface boundary)
-    let triangles = marching_cubes(&field, &normals, nx, ny, nz, min, grid_spacing, 0.0);
+    
 
-    triangles
+    marching_cubes(&field, &normals, nx, ny, nz, min, grid_spacing, 0.0)
 }
 
 /// Marching cubes algorithm implementation

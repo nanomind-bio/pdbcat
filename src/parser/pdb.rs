@@ -235,7 +235,7 @@ fn determine_bonds_with_ter(atoms: &[Atom], ter_positions: &HashSet<(char, i32)>
     }
 
     // Add intra-residue bonds from topology
-    for (_key, indices) in &residue_atoms {
+    for indices in residue_atoms.values() {
         if indices.is_empty() {
             continue;
         }

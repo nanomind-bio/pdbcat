@@ -55,6 +55,7 @@ impl Atom {
 
 /// Chemical element with associated properties
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum Element {
     H,
     C,
@@ -74,6 +75,7 @@ pub enum Element {
     I,
     Se,
     /// Unknown or unrecognized element
+    #[default]
     Unknown,
 }
 
@@ -199,8 +201,3 @@ impl Element {
     }
 }
 
-impl Default for Element {
-    fn default() -> Self {
-        Element::Unknown
-    }
-}

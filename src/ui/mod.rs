@@ -1329,6 +1329,89 @@ impl App {
             self.camera.zoom = 2.0 / max_dim;
         }
     }
+
+    /// Compute the screen-space bounding box of all visible atoms.
+    /// Returns (min_x, min_y, max_x, max_y) in pixel coordinates.
+    /// Also accounts for atom radii based on representation.
+    fn compute_projected_bounds(&self, width: usize, height: usize) -> Option<(f32, f32, f32, f32)> {
+        let pixel_width = width as f32;
+        let pixel_height = height as f32;
+        let center_x = pixel_width / 2.0;
+        let center_y = pixel_height / 2.0;
+        let min_dim = pixel_width.min(pixel_height);
+        let base_scale = min_dim * 0.45;
+        let screen_scale = min_dim * 0.5;
+
+        // Base radius for atoms/elements in screen space
+        // This depends on representation - cartoon tubes are wider than backbone lines
+        let base_radius = match self.representation {
+            Representation::Cartoon => base_scale * 0.04,
+            Representation::Surface => base_scale * 0.05,
+            Representation::Backbone => base_scale * 0.01,
+        };
+
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+
+        for instance in &self.current_assembly().instances {
+            for atom in &self.molecule.atoms {
+                if !self.is_atom_visible(atom) || !instance.applies_to_chain(atom.chain_id) {
+                    continue;
+                }
+
+                let world = instance.transform.apply(atom.coord);
+                let (screen_pos, _z, size_scale) = self.camera.project_with_scale(world, screen_scale);
+                let sx = center_x + screen_pos.x * base_scale;
+                let sy = center_y + screen_pos.y * base_scale;
+
+                // Compute effective radius in screen space
+                let effective_radius = base_radius * (size_scale / self.camera.zoom);
+
+                min_x = min_x.min(sx - effective_radius);
+                min_y = min_y.min(sy - effective_radius);
+                max_x = max_x.max(sx + effective_radius);
+                max_y = max_y.max(sy + effective_radius);
+            }
+        }
+
+        if min_x <= max_x && min_y <= max_y {
+            Some((min_x, min_y, max_x, max_y))
+        } else {
+            None
+        }
+    }
+
+    /// Adjust camera zoom so the molecule fills the frame with a small margin.
+    /// This is a two-pass approach: project once to measure, then adjust zoom.
+    fn fit_zoom_to_frame(&mut self, width: usize, height: usize, margin: f32) {
+        let Some((min_x, min_y, max_x, max_y)) = self.compute_projected_bounds(width, height) else {
+            return;
+        };
+
+        let pixel_width = width as f32;
+        let pixel_height = height as f32;
+        let center_x = pixel_width / 2.0;
+        let center_y = pixel_height / 2.0;
+
+        // Calculate current extent from center (max distance to any edge, doubled for full span)
+        let used_width = (max_x - center_x).max(center_x - min_x) * 2.0;
+        let used_height = (max_y - center_y).max(center_y - min_y) * 2.0;
+
+        if used_width < 1.0 || used_height < 1.0 {
+            return;
+        }
+
+        // Calculate scale to fill the frame with margin, preserving aspect ratio
+        let target_width = pixel_width - margin * 2.0;
+        let target_height = pixel_height - margin * 2.0;
+        let scale = (target_width / used_width)
+            .min(target_height / used_height)
+            .clamp(0.5, 2.0);
+
+        self.camera.zoom *= scale;
+    }
 }
 
 /// Run benchmark mode: high-quality rendering with auto-rotation for 2 seconds
@@ -1508,6 +1591,9 @@ pub fn render_to_png(
     app.color_scheme = options.color_scheme;
     app.shading_enabled = options.shading;
 
+    // Auto-fit zoom for non-interactive mode (fills frame with small margin)
+    app.fit_zoom_to_frame(width, height, 4.0);
+
     // Create pixel buffer at desired resolution
     let mut buffer = PixelBuffer::new(width, height);
     if let Some(bg) = options.background {
@@ -1585,6 +1671,9 @@ pub fn render_to_stdout(
     app.representation = options.representation;
     app.color_scheme = options.color_scheme;
     app.shading_enabled = options.shading;
+
+    // Auto-fit zoom for non-interactive mode (fills frame with small margin)
+    app.fit_zoom_to_frame(width, height, 4.0);
 
     // Create pixel buffer at desired resolution
     let mut buffer = PixelBuffer::new(width, height);

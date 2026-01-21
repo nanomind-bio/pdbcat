@@ -738,7 +738,7 @@ fn tokenize_mmcif_line(line: &str) -> Vec<&str> {
     let mut quote_char = '"';
     let mut token_start: Option<usize> = None;
 
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in chars {
         if in_quote {
             if c == quote_char {
                 if let Some(start) = token_start {
