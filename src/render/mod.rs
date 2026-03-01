@@ -10,9 +10,9 @@ pub mod braille;
 mod pixel;
 pub mod surface;
 
-pub use camera::{Camera, ProjectionMode};
-pub use pixel::{PixelBuffer, downsample_2x, apply_edge_aa, apply_silhouette_edges, apply_ssao, apply_tone_mapping, fill_depth_gaps};
-pub use surface::{generate_surface, Triangle, SurfaceAtom};
+pub use camera::Camera;
+pub use pixel::{PixelBuffer, apply_edge_aa, apply_silhouette_edges, apply_ssao, apply_tone_mapping, fill_depth_gaps};
+pub use surface::{generate_surface, SurfaceAtom};
 
 /// Representation style for rendering molecules
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

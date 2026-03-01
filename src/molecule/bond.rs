@@ -28,6 +28,7 @@ impl Bond {
 }
 
 /// Bond order (single, double, triple, aromatic)
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BondOrder {
     #[default]

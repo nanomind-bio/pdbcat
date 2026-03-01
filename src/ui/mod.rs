@@ -8,7 +8,6 @@ pub use output::RenderBackend;
 
 use crate::molecule::{Assembly, Molecule, SecondaryStructure};
 use crate::render::{PixelBuffer, Camera, ColorScheme, Representation, chain_color, rainbow_color, apply_edge_aa, apply_silhouette_edges, apply_ssao, apply_tone_mapping, fill_depth_gaps, generate_surface, SurfaceAtom};
-use rayon::prelude::*;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -41,6 +40,7 @@ pub struct RenderOptions {
 }
 
 /// UI-related errors
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum UiError {
     #[error("Terminal error: {0}")]
@@ -76,9 +76,7 @@ impl AltLocMode {
     }
 }
 
-const TILE_SIZE: usize = 64;
-const TILE_THRESHOLD: usize = 128;
-
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct ProjInfo {
     x: f32,
@@ -86,162 +84,6 @@ struct ProjInfo {
     z: f32,
     size_scale: f32,
     color: (u8, u8, u8),
-}
-
-#[derive(Clone, Copy)]
-struct Bounds {
-    min_x: i32,
-    max_x: i32,
-    min_y: i32,
-    max_y: i32,
-}
-
-impl Bounds {
-    fn from_circle(cx: f32, cy: f32, radius: f32) -> Self {
-        let min_x = (cx - radius).floor() as i32;
-        let max_x = (cx + radius).ceil() as i32;
-        let min_y = (cy - radius).floor() as i32;
-        let max_y = (cy + radius).ceil() as i32;
-        Self { min_x, max_x, min_y, max_y }
-    }
-
-    fn from_segment(x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) -> Self {
-        let min_x = (x0.min(x1) - radius).floor() as i32;
-        let max_x = (x0.max(x1) + radius).ceil() as i32;
-        let min_y = (y0.min(y1) - radius).floor() as i32;
-        let max_y = (y0.max(y1) + radius).ceil() as i32;
-        Self { min_x, max_x, min_y, max_y }
-    }
-
-    fn intersects(&self, other: &Bounds) -> bool {
-        !(self.max_x < other.min_x
-            || self.min_x > other.max_x
-            || self.max_y < other.min_y
-            || self.min_y > other.max_y)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Tile {
-    x0: i32,
-    y0: i32,
-    width: usize,
-    height: usize,
-}
-
-impl Tile {
-    fn bounds(&self) -> Bounds {
-        let max_x = self.x0 + self.width as i32 - 1;
-        let max_y = self.y0 + self.height as i32 - 1;
-        Bounds {
-            min_x: self.x0,
-            max_x,
-            min_y: self.y0,
-            max_y,
-        }
-    }
-}
-
-enum Primitive {
-    Sphere { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
-    Cylinder { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
-    Line { x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8), bounds: Bounds },
-    Circle { x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8), bounds: Bounds },
-}
-
-impl Primitive {
-    fn sphere(x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8)) -> Self {
-        let bounds = Bounds::from_circle(x, y, radius);
-        Primitive::Sphere { x, y, z, radius, color, bounds }
-    }
-
-    fn cylinder(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, radius: f32, color: (u8, u8, u8)) -> Self {
-        let bounds = Bounds::from_segment(x0, y0, x1, y1, radius);
-        Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color, bounds }
-    }
-
-    fn line(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, color: (u8, u8, u8)) -> Self {
-        let bounds = Bounds::from_segment(x0, y0, x1, y1, 0.5);
-        Primitive::Line { x0, y0, z0, x1, y1, z1, color, bounds }
-    }
-
-    fn circle(x: f32, y: f32, z: f32, radius: f32, color: (u8, u8, u8)) -> Self {
-        let bounds = Bounds::from_circle(x, y, radius);
-        Primitive::Circle { x, y, z, radius, color, bounds }
-    }
-
-    fn bounds(&self) -> Bounds {
-        match self {
-            Primitive::Sphere { bounds, .. } => *bounds,
-            Primitive::Cylinder { bounds, .. } => *bounds,
-            Primitive::Line { bounds, .. } => *bounds,
-            Primitive::Circle { bounds, .. } => *bounds,
-        }
-    }
-
-    fn draw_offset(&self, buffer: &mut PixelBuffer, offset_x: i32, offset_y: i32) {
-        let ox = offset_x as f32;
-        let oy = offset_y as f32;
-        match *self {
-            Primitive::Sphere { x, y, z, radius, color, .. } => {
-                buffer.draw_sphere_shaded(x - ox, y - oy, z, radius, color);
-            }
-            Primitive::Cylinder { x0, y0, z0, x1, y1, z1, radius, color, .. } => {
-                buffer.draw_cylinder_shaded(x0 - ox, y0 - oy, z0, x1 - ox, y1 - oy, z1, radius, color);
-            }
-            Primitive::Line { x0, y0, z0, x1, y1, z1, color, .. } => {
-                buffer.draw_line(x0 - ox, y0 - oy, z0, x1 - ox, y1 - oy, z1, color);
-            }
-            Primitive::Circle { x, y, z, radius, color, .. } => {
-                buffer.draw_circle(x - ox, y - oy, z, radius, color);
-            }
-        }
-    }
-}
-
-fn render_primitives_tiled(buffer: &mut PixelBuffer, primitives: &[Primitive]) {
-    if primitives.is_empty() {
-        return;
-    }
-
-    let width = buffer.width();
-    let height = buffer.height();
-    let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-    let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
-
-    let mut tiles = Vec::with_capacity(tiles_x * tiles_y);
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let x0 = (tx * TILE_SIZE) as i32;
-            let y0 = (ty * TILE_SIZE) as i32;
-            let tile_w = TILE_SIZE.min(width.saturating_sub(tx * TILE_SIZE));
-            let tile_h = TILE_SIZE.min(height.saturating_sub(ty * TILE_SIZE));
-            if tile_w == 0 || tile_h == 0 {
-                continue;
-            }
-            tiles.push(Tile { x0, y0, width: tile_w, height: tile_h });
-        }
-    }
-
-    let rendered: Vec<(usize, usize, PixelBuffer)> = tiles
-        .par_iter()
-        .map(|tile| {
-            let mut local = PixelBuffer::new(tile.width, tile.height);
-            let tile_bounds = tile.bounds();
-
-            for prim in primitives {
-                if prim.bounds().intersects(&tile_bounds) {
-                    prim.draw_offset(&mut local, tile.x0, tile.y0);
-                }
-            }
-
-            (tile.x0 as usize, tile.y0 as usize, local)
-        })
-        .collect();
-
-    for (x0, y0, local) in rendered {
-        buffer.blit_from(&local, x0, y0);
-    }
 }
 
 /// Application state
@@ -709,8 +551,6 @@ impl App {
         _z_min: f32,
         _z_max: f32,
     ) {
-        use nalgebra::Vector3;
-
         // Build atom list for surface generation
         // Map atom index to color from projected list
         let mut color_map: std::collections::HashMap<usize, (u8, u8, u8)> = std::collections::HashMap::new();
@@ -1063,55 +903,6 @@ impl App {
         }
     }
 
-    /// Draw a smooth spline-based ribbon segment using Catmull-Rom interpolation
-    fn draw_spline_ribbon(
-        &self,
-        buffer: &mut PixelBuffer,
-        p0: (f32, f32, f32),  // Control point before start
-        p1: (f32, f32, f32),  // Start point
-        p2: (f32, f32, f32),  // End point
-        p3: (f32, f32, f32),  // Control point after end
-        color: (u8, u8, u8),
-        width: f32,
-    ) {
-        // Number of interpolation steps (more = smoother)
-        let steps = 8;
-
-        let mut prev_x = p1.0;
-        let mut prev_y = p1.1;
-        let mut prev_z = p1.2;
-
-        for i in 1..=steps {
-            let t = i as f32 / steps as f32;
-
-            // Catmull-Rom spline interpolation
-            let t2 = t * t;
-            let t3 = t2 * t;
-
-            let x = 0.5 * ((2.0 * p1.0)
-                + (-p0.0 + p2.0) * t
-                + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
-                + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
-
-            let y = 0.5 * ((2.0 * p1.1)
-                + (-p0.1 + p2.1) * t
-                + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
-                + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
-
-            let z = 0.5 * ((2.0 * p1.2)
-                + (-p0.2 + p2.2) * t
-                + (2.0 * p0.2 - 5.0 * p1.2 + 4.0 * p2.2 - p3.2) * t2
-                + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
-
-            // Draw ribbon segment
-            self.draw_ribbon(buffer, prev_x, prev_y, prev_z, x, y, z, color, width);
-
-            prev_x = x;
-            prev_y = y;
-            prev_z = z;
-        }
-    }
-
     /// Draw a shaded ribbon segment with 3D tube appearance
     fn draw_ribbon_shaded(
         &self,
@@ -1169,89 +960,6 @@ impl App {
             prev_x = x;
             prev_y = y;
             prev_z = z;
-        }
-    }
-
-    /// Draw a smooth spline-based flat sheet (for beta strands)
-    fn draw_spline_sheet_shaded(
-        &self,
-        buffer: &mut PixelBuffer,
-        p0: (f32, f32, f32),
-        p1: (f32, f32, f32),
-        p2: (f32, f32, f32),
-        p3: (f32, f32, f32),
-        color: (u8, u8, u8),
-        width: f32,
-    ) {
-        let steps = 6;
-        let mut prev_x = p1.0;
-        let mut prev_y = p1.1;
-        let mut prev_z = p1.2;
-
-        for i in 1..=steps {
-            let t = i as f32 / steps as f32;
-            let t2 = t * t;
-            let t3 = t2 * t;
-
-            let x = 0.5 * ((2.0 * p1.0)
-                + (-p0.0 + p2.0) * t
-                + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
-                + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
-
-            let y = 0.5 * ((2.0 * p1.1)
-                + (-p0.1 + p2.1) * t
-                + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
-                + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
-
-            let z = 0.5 * ((2.0 * p1.2)
-                + (-p0.2 + p2.2) * t
-                + (2.0 * p0.2 - 5.0 * p1.2 + 4.0 * p2.2 - p3.2) * t2
-                + (-p0.2 + 3.0 * p1.2 - 3.0 * p2.2 + p3.2) * t3);
-
-            // Use flat sheet instead of cylinder for beta strands
-            buffer.draw_flat_sheet(prev_x, prev_y, prev_z, x, y, z, width, color);
-
-            prev_x = x;
-            prev_y = y;
-            prev_z = z;
-        }
-    }
-
-    fn draw_arrowhead(
-        &self,
-        buffer: &mut PixelBuffer,
-        tip_x: f32,
-        tip_y: f32,
-        tip_z: f32,
-        dir: Vector2<f32>,
-        color: (u8, u8, u8),
-        length: f32,
-        width: f32,
-    ) {
-        let dir_len = (dir.x * dir.x + dir.y * dir.y).sqrt();
-        if dir_len < 1e-3 {
-            return;
-        }
-
-        let dx = dir.x / dir_len;
-        let dy = dir.y / dir_len;
-        let px = -dy;
-        let py = dx;
-
-        let length = length.max(2.0);
-        let width = width.max(2.0);
-        let base_x = tip_x - dx * length;
-        let base_y = tip_y - dy * length;
-        let steps = (length.round() as i32).clamp(2, 12);
-
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let cx = base_x + dx * length * t;
-            let cy = base_y + dy * length * t;
-            let half = (width * t * 0.5).max(0.5);
-            let ox = px * half;
-            let oy = py * half;
-            buffer.draw_line(cx - ox, cy - oy, tip_z, cx + ox, cy + oy, tip_z, color);
         }
     }
 

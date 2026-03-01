@@ -16,6 +16,7 @@ pub struct Triangle {
 }
 
 /// Atom data for surface generation
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceAtom {
     pub pos: Vector3<f32>,

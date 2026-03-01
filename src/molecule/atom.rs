@@ -3,6 +3,7 @@
 use nalgebra::Vector3;
 
 /// A single atom in a molecular structure
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Atom {
     /// Atom serial number
@@ -38,6 +39,7 @@ impl Atom {
     }
 
     /// Check if this is a backbone atom
+    #[allow(dead_code)]
     pub fn is_backbone(&self) -> bool {
         matches!(self.name.as_str(), "N" | "CA" | "C" | "O" | "P" | "O3'" | "O5'" | "C3'" | "C4'" | "C5'")
     }
@@ -48,6 +50,7 @@ impl Atom {
     }
 
     /// Get the covalent radius for this atom (for ball-and-stick)
+    #[allow(dead_code)]
     pub fn covalent_radius(&self) -> f32 {
         self.element.covalent_radius()
     }
@@ -129,6 +132,7 @@ impl Element {
     }
 
     /// Get covalent radius in Ångströms (for ball-and-stick models)
+    #[allow(dead_code)]
     pub fn covalent_radius(&self) -> f32 {
         match self {
             Element::H => 0.31,
@@ -153,6 +157,7 @@ impl Element {
     }
 
     /// Get CPK color as RGB tuple
+    #[allow(dead_code)]
     pub fn cpk_color(&self) -> (u8, u8, u8) {
         match self {
             Element::H => (255, 255, 255),  // White
@@ -177,6 +182,7 @@ impl Element {
     }
 
     /// Get element symbol
+    #[allow(dead_code)]
     pub fn symbol(&self) -> &'static str {
         match self {
             Element::H => "H",

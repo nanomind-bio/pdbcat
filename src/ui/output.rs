@@ -21,6 +21,7 @@ impl RenderBackend {
     }
 
     /// Check if this backend supports inline images
+    #[allow(dead_code)]
     pub fn supports_images(self) -> bool {
         matches!(self, RenderBackend::ITerm2)
     }

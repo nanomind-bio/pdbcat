@@ -5,7 +5,6 @@ pub mod mmcif;
 mod topology;
 
 pub use pdb::parse_pdb;
-pub use pdb::determine_bonds_shared;
 pub use mmcif::parse_mmcif;
 
 use crate::molecule::Molecule;
@@ -22,6 +21,7 @@ pub enum FileFormat {
 }
 
 /// Errors that can occur during parsing
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum ParseError {
     #[error("Failed to read file: {0}")]
@@ -44,8 +44,14 @@ pub enum ParseError {
 pub fn parse_file(path: &Path, format: FileFormat) -> Result<Molecule, ParseError> {
     let content = std::fs::read_to_string(path)?;
 
-    match format {
+    let molecule = match format {
         FileFormat::Pdb => parse_pdb(&content),
         FileFormat::MmCif => parse_mmcif(&content),
+    }?;
+
+    if molecule.atoms.is_empty() {
+        return Err(ParseError::InvalidFormat("No valid atoms found".to_string()));
     }
+
+    Ok(molecule)
 }

@@ -33,6 +33,7 @@ impl ProjectionMode {
 }
 
 /// Camera state for viewing the molecule
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Camera {
     /// Current rotation as a unit quaternion
@@ -102,6 +103,7 @@ impl Camera {
     /// the distance from camera to the projection plane.
     /// Returns (screen_position, depth, size_scale) where size_scale should be
     /// applied to radii/widths to maintain correct perspective sizing.
+    #[allow(dead_code)]
     pub fn project(&self, point: Vector3<f32>) -> (Vector2<f32>, f32, f32) {
         self.project_with_scale(point, 1.0)
     }
@@ -187,6 +189,7 @@ impl Camera {
     }
 
     /// Fit the view to show the entire molecule
+    #[allow(dead_code)]
     pub fn fit_to_bounds(&mut self, min: Vector3<f32>, max: Vector3<f32>, screen_size: (u16, u16)) {
         // Calculate molecule size
         let size = max - min;

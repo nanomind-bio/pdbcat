@@ -10,12 +10,13 @@ mod secondary;
 
 pub use atom::{Atom, Element};
 pub use assembly::{Assembly, AssemblyInstance, Transform};
-pub use bond::{Bond, BondOrder};
+pub use bond::Bond;
 pub use secondary::{HelixType, SecondaryStructure, SecondaryStructureAssignment};
 
 use nalgebra::Vector3;
 
 /// A complete molecular structure
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Molecule {
     /// All atoms in the structure
@@ -56,6 +57,7 @@ impl Molecule {
     }
 
     /// Get the bounding box of all atoms (min, max)
+    #[allow(dead_code)]
     pub fn bounding_box(&self) -> (Vector3<f32>, Vector3<f32>) {
         if self.atoms.is_empty() {
             return (Vector3::zeros(), Vector3::zeros());
@@ -77,11 +79,13 @@ impl Molecule {
     }
 
     /// Get atoms for a specific chain
+    #[allow(dead_code)]
     pub fn atoms_in_chain(&self, chain_id: char) -> impl Iterator<Item = &Atom> {
         self.atoms.iter().filter(move |a| a.chain_id == chain_id)
     }
 
     /// Get backbone atoms (CA for proteins, P for nucleic acids)
+    #[allow(dead_code)]
     pub fn backbone_atoms(&self) -> Vec<&Atom> {
         self.atoms
             .iter()

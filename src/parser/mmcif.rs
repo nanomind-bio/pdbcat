@@ -167,6 +167,11 @@ fn parse_atom_site_row(line: &str, columns: &[String]) -> Result<Option<Atom>, P
     let y: f32 = col_map.get("Cartn_y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let z: f32 = col_map.get("Cartn_z").and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
+    // Skip atoms with NaN coordinates (e.g. unfilled prediction outputs)
+    if x.is_nan() || y.is_nan() || z.is_nan() {
+        return Ok(None);
+    }
+
     let occupancy: f32 = col_map.get("occupancy").and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let temp_factor: f32 = col_map.get("B_iso_or_equiv").and_then(|s| s.parse().ok()).unwrap_or(0.0);
 

@@ -38,6 +38,7 @@ struct CylinderProfileKey {
     radius_q: i32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CylinderProfile {
     radius: f32,
@@ -261,128 +262,6 @@ fn build_cylinder_profile(key: CylinderProfileKey) -> CylinderProfile {
     }
 }
 
-/// Precomputed sRGB to linear lookup table (256 entries)
-/// Eliminates expensive pow() calls in hot paths
-const SRGB_TO_LINEAR_LUT: [f32; 256] = {
-    let mut lut = [0.0_f32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let c = i as f32 / 255.0;
-        lut[i] = if c <= 0.04045 {
-            c / 12.92
-        } else {
-            // Manual pow approximation for const context
-            // (c + 0.055) / 1.055 raised to 2.4
-            let base = (c + 0.055) / 1.055;
-            // Use exp(2.4 * ln(base)) approximation via iteration
-            let ln_base = const_ln(base);
-            const_exp(2.4 * ln_base)
-        };
-        i += 1;
-    }
-    lut
-};
-
-/// Const-compatible natural log approximation
-const fn const_ln(x: f32) -> f32 {
-    // ln(x) using series expansion around 1
-    // For x in [0.5, 1], use ln(x) = -ln(1/x)
-    // We work with x in range ~0.05 to 1.0
-    if x <= 0.0 {
-        return f32::NEG_INFINITY;
-    }
-
-    // Reduce to range [0.5, 1] by extracting powers of 2
-    let mut mantissa = x;
-    let mut exp = 0_i32;
-    while mantissa < 0.5 {
-        mantissa *= 2.0;
-        exp -= 1;
-    }
-    while mantissa > 1.0 {
-        mantissa *= 0.5;
-        exp += 1;
-    }
-
-    // ln(mantissa) where mantissa in [0.5, 1]
-    // Use ln(1+u) series where u = mantissa - 1
-    let u = mantissa - 1.0;
-    let u2 = u * u;
-    let u3 = u2 * u;
-    let u4 = u3 * u;
-    let u5 = u4 * u;
-    let ln_m = u - u2/2.0 + u3/3.0 - u4/4.0 + u5/5.0;
-
-    // ln(x) = ln(mantissa * 2^exp) = ln(mantissa) + exp * ln(2)
-    ln_m + (exp as f32) * std::f32::consts::LN_2
-}
-
-/// Const-compatible exp approximation
-const fn const_exp(x: f32) -> f32 {
-    // exp(x) using Taylor series
-    // Reduce range: exp(x) = exp(x - n*ln2) * 2^n
-    let ln2 = std::f32::consts::LN_2;
-    let n = (x / ln2) as i32;
-    let r = x - (n as f32) * ln2;
-
-    // Taylor series for exp(r) where |r| < ln(2)
-    let r2 = r * r;
-    let r3 = r2 * r;
-    let r4 = r3 * r;
-    let r5 = r4 * r;
-    let exp_r = 1.0 + r + r2/2.0 + r3/6.0 + r4/24.0 + r5/120.0;
-
-    // Multiply by 2^n
-    let mut result = exp_r;
-    let mut i = 0;
-    if n > 0 {
-        while i < n {
-            result *= 2.0;
-            i += 1;
-        }
-    } else {
-        while i > n {
-            result *= 0.5;
-            i -= 1;
-        }
-    }
-    result
-}
-
-/// Convert sRGB color component (0-255) to linear color space (0.0-1.0)
-/// Uses precomputed lookup table for speed
-#[inline]
-fn srgb_to_linear(c: u8) -> f32 {
-    SRGB_TO_LINEAR_LUT[c as usize]
-}
-
-/// Precomputed linear to sRGB lookup table (1024 entries for [0,1] range)
-/// 10-bit precision is sufficient for 8-bit output
-const LINEAR_TO_SRGB_LUT: [u8; 1024] = {
-    let mut lut = [0_u8; 1024];
-    let mut i = 0;
-    while i < 1024 {
-        let c = i as f32 / 1023.0;
-        let v = if c <= 0.0031308 {
-            12.92 * c
-        } else {
-            let ln_c = const_ln(c);
-            1.055 * const_exp(ln_c / 2.4) - 0.055
-        };
-        lut[i] = if v <= 0.0 { 0 } else if v >= 1.0 { 255 } else { (v * 255.0 + 0.5) as u8 };
-        i += 1;
-    }
-    lut
-};
-
-/// Convert linear color component (0.0-1.0) to sRGB (0-255)
-/// Uses precomputed lookup table for speed
-#[inline]
-fn linear_to_srgb(c: f32) -> u8 {
-    let idx = (c.clamp(0.0, 1.0) * 1023.0) as usize;
-    LINEAR_TO_SRGB_LUT[idx]
-}
-
 /// A pixel buffer with depth testing.
 #[derive(Debug, Clone)]
 pub struct PixelBuffer {
@@ -442,49 +321,6 @@ impl PixelBuffer {
         self.height
     }
 
-    /// Get raw depth buffer for parallel access
-    pub fn depth_buffer(&self) -> &[f32] {
-        &self.depth
-    }
-
-    /// Merge another buffer into this one using depth testing.
-    /// Used for combining parallel-rendered tile buffers.
-    pub fn merge_from(&mut self, other: &PixelBuffer) {
-        debug_assert_eq!(self.width, other.width);
-        debug_assert_eq!(self.height, other.height);
-
-        for i in 0..self.colors.len() {
-            if other.colors[i].3 > 0 && other.depth[i] > self.depth[i] {
-                self.colors[i] = other.colors[i];
-                self.depth[i] = other.depth[i];
-            }
-        }
-    }
-
-    /// Copy a smaller buffer into this one at a given offset.
-    pub fn blit_from(&mut self, src: &PixelBuffer, dst_x: usize, dst_y: usize) {
-        debug_assert!(dst_x + src.width <= self.width);
-        debug_assert!(dst_y + src.height <= self.height);
-
-        for y in 0..src.height {
-            let dst_row = (dst_y + y) * self.width + dst_x;
-            let src_row = y * src.width;
-            for x in 0..src.width {
-                let src_idx = src_row + x;
-                let dst_idx = dst_row + x;
-                let src_color = src.colors[src_idx];
-                if src_color.3 == 0 {
-                    continue;
-                }
-                let src_depth = src.depth[src_idx];
-                if src_depth > self.depth[dst_idx] {
-                    self.colors[dst_idx] = src_color;
-                    self.depth[dst_idx] = src_depth;
-                }
-            }
-        }
-    }
-
     /// Get a pixel's RGBA value.
     pub fn get_pixel(&self, x: usize, y: usize) -> (u8, u8, u8, u8) {
         if x >= self.width || y >= self.height {
@@ -540,6 +376,7 @@ impl PixelBuffer {
 
     /// Draw a filled circle (flat shading) - LUT-based for performance.
     /// Reuses sphere LUT span structure but with flat color (no shading math).
+    #[allow(dead_code)]
     pub fn draw_circle(
         &mut self,
         cx: f32,
@@ -800,6 +637,7 @@ impl PixelBuffer {
     }
 
     /// Draw an anti-aliased line using subpixel rendering.
+    #[allow(dead_code)]
     pub fn draw_line_aa(
         &mut self,
         x0: f32,
@@ -834,12 +672,12 @@ impl PixelBuffer {
             // Anti-aliased neighbors (simplified coverage)
             if fx > 0.3 {
                 let blend = (1.0 - fx) * 0.5;
-                let aa_color = blend_color(color, blend);
+                let aa_color = ((color.0 as f32 * blend) as u8, (color.1 as f32 * blend) as u8, (color.2 as f32 * blend) as u8);
                 self.set_pixel(xi + 1, yi, z, aa_color);
             }
             if fy > 0.3 {
                 let blend = (1.0 - fy) * 0.5;
-                let aa_color = blend_color(color, blend);
+                let aa_color = ((color.0 as f32 * blend) as u8, (color.1 as f32 * blend) as u8, (color.2 as f32 * blend) as u8);
                 self.set_pixel(xi, yi + 1, z, aa_color);
             }
         }
@@ -847,6 +685,7 @@ impl PixelBuffer {
 
     /// Draw a flat ribbon/plank for beta sheets - uses filled rectangle approach
     /// to avoid fanning artifacts on curves
+    #[allow(dead_code)]
     pub fn draw_flat_sheet(
         &mut self,
         x0: f32,
@@ -1170,102 +1009,6 @@ impl PixelBuffer {
             }
         }
     }
-}
-
-/// Blend a color towards darker for anti-aliasing coverage
-fn blend_color(color: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
-    (
-        (color.0 as f32 * factor) as u8,
-        (color.1 as f32 * factor) as u8,
-        (color.2 as f32 * factor) as u8,
-    )
-}
-
-/// Downsample a buffer by 2x using box filtering for anti-aliasing.
-/// Returns a new buffer at half the dimensions.
-/// Uses parallel processing for improved performance.
-/// IMPORTANT: Blends in linear color space for correct anti-aliasing.
-pub fn downsample_2x(src: &PixelBuffer) -> PixelBuffer {
-    let dst_width = src.width() / 2;
-    let dst_height = src.height() / 2;
-
-    if dst_width == 0 || dst_height == 0 {
-        return PixelBuffer::new(1, 1);
-    }
-
-    let src_width = src.width();
-    let mut dst = PixelBuffer::new(dst_width, dst_height);
-
-    dst.colors
-        .par_chunks_mut(dst_width)
-        .zip(dst.depth.par_chunks_mut(dst_width))
-        .enumerate()
-        .for_each(|(y, (row_colors, row_depths))| {
-            let sy0 = y * 2;
-            let sy1 = sy0 + 1;
-            let row0 = sy0 * src_width;
-            let row1 = sy1 * src_width;
-
-            for x in 0..dst_width {
-                let sx0 = x * 2;
-                let idx0 = row0 + sx0;
-                let idx1 = idx0 + 1;
-                let idx2 = row1 + sx0;
-                let idx3 = idx2 + 1;
-
-                let (r0, g0, b0, a0) = src.colors[idx0];
-                let (r1, g1, b1, a1) = src.colors[idx1];
-                let (r2, g2, b2, a2) = src.colors[idx2];
-                let (r3, g3, b3, a3) = src.colors[idx3];
-
-                let mut r_lin = 0.0;
-                let mut g_lin = 0.0;
-                let mut b_lin = 0.0;
-                let mut a_sum = 0.0;
-                let max_z = src.depth[idx0].max(src.depth[idx1]).max(src.depth[idx2]).max(src.depth[idx3]);
-
-                let alpha0 = a0 as f32 / 255.0;
-                let alpha1 = a1 as f32 / 255.0;
-                let alpha2 = a2 as f32 / 255.0;
-                let alpha3 = a3 as f32 / 255.0;
-
-                r_lin += srgb_to_linear(r0) * alpha0;
-                g_lin += srgb_to_linear(g0) * alpha0;
-                b_lin += srgb_to_linear(b0) * alpha0;
-                a_sum += alpha0;
-
-                r_lin += srgb_to_linear(r1) * alpha1;
-                g_lin += srgb_to_linear(g1) * alpha1;
-                b_lin += srgb_to_linear(b1) * alpha1;
-                a_sum += alpha1;
-
-                r_lin += srgb_to_linear(r2) * alpha2;
-                g_lin += srgb_to_linear(g2) * alpha2;
-                b_lin += srgb_to_linear(b2) * alpha2;
-                a_sum += alpha2;
-
-                r_lin += srgb_to_linear(r3) * alpha3;
-                g_lin += srgb_to_linear(g3) * alpha3;
-                b_lin += srgb_to_linear(b3) * alpha3;
-                a_sum += alpha3;
-
-                let (r, g, b, a) = if a_sum > 0.0 {
-                    (
-                        linear_to_srgb(r_lin / a_sum),
-                        linear_to_srgb(g_lin / a_sum),
-                        linear_to_srgb(b_lin / a_sum),
-                        (a_sum * 255.0 / 4.0) as u8,
-                    )
-                } else {
-                    (0, 0, 0, 0)
-                };
-
-                row_colors[x] = (r, g, b, a);
-                row_depths[x] = max_z;
-            }
-        });
-
-    dst
 }
 
 /// Apply silhouette edge detection to darken edges where depth changes sharply.
