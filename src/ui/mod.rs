@@ -1355,6 +1355,8 @@ impl App {
         let mut max_x = f32::NEG_INFINITY;
         let mut max_y = f32::NEG_INFINITY;
 
+        let radius_scale = base_radius / self.camera.zoom;
+
         for instance in &self.current_assembly().instances {
             for atom in &self.molecule.atoms {
                 if !self.is_atom_visible(atom) || !instance.applies_to_chain(atom.chain_id) {
@@ -1366,8 +1368,7 @@ impl App {
                 let sx = center_x + screen_pos.x * base_scale;
                 let sy = center_y + screen_pos.y * base_scale;
 
-                // Compute effective radius in screen space
-                let effective_radius = base_radius * (size_scale / self.camera.zoom);
+                let effective_radius = radius_scale * size_scale;
 
                 min_x = min_x.min(sx - effective_radius);
                 min_y = min_y.min(sy - effective_radius);

@@ -733,7 +733,7 @@ fn parse_oper_range(part: &str) -> Option<Vec<String>> {
 /// Tokenize a mmCIF data line, handling quoted strings
 fn tokenize_mmcif_line(line: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
-    let mut chars = line.char_indices().peekable();
+    let chars = line.char_indices().peekable();
     let mut in_quote = false;
     let mut quote_char = '"';
     let mut token_start: Option<usize> = None;

@@ -13,7 +13,6 @@ pub enum SecondaryStructure {
     Coil,
 }
 
-
 /// Types of helical secondary structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -26,7 +25,6 @@ pub enum HelixType {
     /// Pi helix
     Pi,
 }
-
 
 /// Assignment of secondary structure to a range of residues
 #[derive(Debug, Clone)]
