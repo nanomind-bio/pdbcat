@@ -24,15 +24,26 @@ A quick terminal viewer for PDB and mmCIF files. **Not a replacement for PyMOL o
 
 ## Installation
 
+### From crates.io
+
 ```bash
-cargo install --path .
+cargo install pdbcat
 ```
 
-Or build from source:
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/nanomind-bio/pdbcat/releases/latest).
+
+Or install with the installer script:
 
 ```bash
-cargo build --release
-./target/release/pdbcat structure.pdb
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nanomind-bio/pdbcat/releases/latest/download/pdbcat-installer.sh | sh
+```
+
+### From source
+
+```bash
+cargo install --path .
 ```
 
 ## Usage

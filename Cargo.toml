@@ -2,9 +2,15 @@
 name = "pdbcat"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 description = "Terminal-based PDB/mmCIF molecular structure viewer"
 license = "MIT"
-authors = []
+authors = ["Andres Torrubia <info@nanomind.bio>"]
+repository = "https://github.com/nanomind-bio/pdbcat"
+homepage = "https://github.com/nanomind-bio/pdbcat"
+keywords = ["pdb", "molecular", "viewer", "terminal", "protein"]
+categories = ["command-line-utilities", "science", "visualization"]
+exclude = ["assets/", ".github/"]
 
 [dependencies]
 # Terminal UI
@@ -32,3 +38,8 @@ rayon = "1.10"
 [profile.release]
 lto = true
 opt-level = 3
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
