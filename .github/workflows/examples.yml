@@ -22,6 +22,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: main
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -116,10 +118,12 @@ jobs:
         if [[ "$LAST_MSG" == "Update example images" || "$LAST_MSG" == "Add example images" ]]; then
           echo "Amending previous images commit to avoid history bloat"
           git commit --amend --no-edit
+          git pull --rebase origin main
           git push --force-with-lease
         else
           echo "Creating new images commit"
           git commit -m "Update example images"
+          git pull --rebase origin main
           git push
         fi
       env:
